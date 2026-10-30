@@ -2,15 +2,30 @@
 
 UT-style kill announcer + world-attached TGA overlays for Return of Reckoning.
 
+Based on **[UnrealDBAnnouncer](https://forums.returnofreckoning.com/viewtopic.php?t=32918)**
+by **ztil** and **Wholdar**. UnrealFX keeps the kill-log + external sound helper idea
+and adds world-attached FX overlays, a Python/PyInstaller watcher, and related alert baggage.
+
 ## Install
 
 1. Place this folder in `Interface\AddOns\UnrealFX`
 2. Enable **UnrealFX** in the addon list (disable **UnrealDBAnnouncer** if both are installed)
-3. Start the sound helper: `python UnrealFX.py`  
-   Window title is `UnrealFX` — bind that in OBS Application Audio Capture
+3. Start the sound helper: run `UnrealFX.exe` (or `python UnrealFX.py`)  
+   Window title is `UnrealFX` — bind that in OBS Application Audio Capture  
+   `StartRoR.cmd` prefers `UnrealFX.exe` when present
 4. In-game: `/ufx help`
 
 Requires [LibSlash](https://www.curseforge.com/) (or whatever ships with your UI pack).
+
+### Rebuild `UnrealFX.exe`
+
+From this folder (needs Python + pip):
+
+```bat
+build_exe.cmd
+```
+
+Uses PyInstaller one-file / windowed. Stdlib only (`tkinter`, `winsound`).
 
 ## Slash
 
@@ -28,7 +43,7 @@ Also registered as `/unrealfx`.
 ## How sound works
 
 - The addon appends a keyword to `logs\UnrealFX.log`
-- `UnrealFX.py` watches that log and plays `files\<keyword>.wav`
+- `UnrealFX.exe` (or `UnrealFX.py`) watches that log and plays `files\<keyword>.wav`
 - Replace any shipped WAV to customize a keyword
 
 ## Alerts

@@ -3,7 +3,7 @@
     <UiMod name="UnrealFX" version="2.0.0" date="2026-10-30">
         <VersionSettings gameVersion="1.4.8" windowsVersion="1.0" savedVariablesVersion="1.0" />
         <Author name="Ztil, Wholdar" email="" />
-        <Description text="UT-style kill announcer with world-attached FX overlays for Return of Reckoning. Plays WAVs via UnrealFX.py (OBS-friendly window). Supports RvR/PVE kills, multi-kill streaks, ready check / scenario / fortress / LOTD alerts, and grow/spin corpse FX. Slash: /ufx. Disable UnrealDBAnnouncer if both are installed." />
+        <Description text="Based on UnrealDBAnnouncer by ztil / Wholdar (RoR forums). UT-style kill announcer with world-attached FX overlays. Plays WAVs via UnrealFX.exe / UnrealFX.py (OBS-friendly window). Supports RvR/PVE kills, multi-kill streaks, ready check / scenario / fortress / LOTD alerts, and grow/spin corpse FX. Slash: /ufx. Disable UnrealDBAnnouncer if both are installed." />
         <WARInfo>
             <Categories>
                 <Category name="RVR" />

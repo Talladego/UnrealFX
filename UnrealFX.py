@@ -26,6 +26,9 @@ WINDOW_TITLE = "UnrealFX"
 
 
 def addon_dir() -> str:
+    # PyInstaller onefile: data/WAVs live next to the .exe, not in _MEIPASS.
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
 
 
