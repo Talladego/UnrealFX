@@ -1,0 +1,51 @@
+<Interface xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../Interface.xsd">
+    <Assets>
+                                                                <!-- BEGIN FX_ASSETS (sync_fx_assets.py) -->
+        <Texture name="UnrealFX_annihilation" file="files/annihilation.tga" />
+        <Texture name="UnrealFX_bloodbath" file="files/bloodbath.tga" />
+        <Texture name="UnrealFX_defeat" file="files/defeat.tga" />
+        <Texture name="UnrealFX_denied" file="files/denied.tga" />
+        <Texture name="UnrealFX_dominating" file="files/dominating.tga" />
+        <Texture name="UnrealFX_doublekill" file="files/doublekill.tga" />
+        <Texture name="UnrealFX_erradication" file="files/erradication.tga" />
+        <Texture name="UnrealFX_extermination" file="files/extermination.tga" />
+        <Texture name="UnrealFX_firstblood" file="files/firstblood.tga" />
+        <Texture name="UnrealFX_godlike" file="files/godlike.tga" />
+        <Texture name="UnrealFX_headshot" file="files/headshot.tga" />
+        <Texture name="UnrealFX_holyshit" file="files/holyshit.tga" />
+        <Texture name="UnrealFX_killingspree" file="files/killingspree.tga" />
+        <Texture name="UnrealFX_ludicrous" file="files/ludicrous.tga" />
+        <Texture name="UnrealFX_megakill" file="files/megakill.tga" />
+        <Texture name="UnrealFX_monsterkill" file="files/monsterkill.tga" />
+        <Texture name="UnrealFX_multikill" file="files/multikill.tga" />
+        <Texture name="UnrealFX_rampage" file="files/rampage.tga" />
+        <Texture name="UnrealFX_slaughter" file="files/slaughter.tga" />
+        <Texture name="UnrealFX_triplekill" file="files/triplekill.tga" />
+        <Texture name="UnrealFX_ultrakill" file="files/ultrakill.tga" />
+        <Texture name="UnrealFX_unstoppable" file="files/unstoppable.tga" />
+        <Texture name="UnrealFX_wickedsick" file="files/wickedsick.tga" />
+        <!-- END FX_ASSETS -->
+    </Assets>
+
+    <Windows>
+        <!-- Runtime instance via CreateWindowFromTemplate(..., "Root"); do not put OnShutdown here. -->
+        <Window name="UnrealFXTemplate" movable="false" savesettings="false" handleinput="false" layer="overlay">
+            <Size>
+                <AbsPoint x="456" y="256" />
+            </Size>
+            <Windows>
+                <!-- Center-anchored like CustomUI SCT labels so scale/pulse grows from the middle. -->
+                <DynamicImage name="$parentImage" texture="UnrealFX_annihilation" handleinput="false" layer="overlay">
+                    <Size>
+                        <AbsPoint x="456" y="256" />
+                    </Size>
+                    <Anchors>
+                        <Anchor point="center" relativePoint="center" relativeTo="$parent">
+                            <AbsPoint x="0" y="0" />
+                        </Anchor>
+                    </Anchors>
+                </DynamicImage>
+            </Windows>
+        </Window>
+    </Windows>
+</Interface>
