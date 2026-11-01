@@ -1,17 +1,20 @@
 # Build the installable UnrealFX zip (addon files + helper exe) and, on a v* tag,
 # publish it as a GitHub Release.
 #
+# - Pull request          -> check and build jobs only (zip artifact). No release,
+#                            no tags, no publish.
 # - Tag v* (e.g. v2.0.1)  -> checks, build, zip, GitHub Release with the zip.
 # - Manual run            -> checks, build, zip as a workflow artifact only.
 #
 # This workflow never uploads anywhere else (in particular NOT to the RoR addon
-# site); publishing there stays a manual step.
+# site); publishing there stays a manual step. The release job is tag-only.
 name: Release
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+  pull_request:
 
 permissions:
   contents: read
@@ -42,7 +45,7 @@ env:
 
 jobs:
   check:
-    name: Checks (Lua syntax, version, ASCII)
+    name: Checks (Lua, Python, version, ASCII)
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -61,6 +64,14 @@ jobs:
         run: |
           find . -name '*.lua' -not -path './.git/*' -print0 | xargs -0 -n1 luac5.1 -p
           echo "All .lua files pass luac5.1 -p"
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Python syntax check
+        run: python -m py_compile UnrealFX.py
 
       - name: Read version (single source UnrealFX.mod) and match tag
         id: version
@@ -172,7 +183,9 @@ jobs:
   release:
     name: GitHub Release (tags only)
     needs: [check, build]
-    if: github.ref_type == 'tag'
+    # pull_request must never publish. workflow_dispatch on a non-tag ref
+    # already fails this check because ref_type is branch.
+    if: github.event_name != 'pull_request' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: write
