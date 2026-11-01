@@ -10,7 +10,6 @@ UnrealFX.helpCommandColor = { 160, 220, 255 }
 -- World-attached announcer FX (TGA overlays). SCT-style: one window per victim so
 -- multi-kills can show on every killed target at once, not only the current target.
 UnrealFX.FX_WINDOW_PREFIX = "UnrealFXWindow"
-UnrealFX.FX_WINDOW = "UnrealFXWindow" -- legacy single-name (retired; pool uses PREFIX..id)
 UnrealFX.FX_TEMPLATE = "UnrealFXTemplate"
 -- Texture pixel size must match files/*.tga (456x256 RLE).
 UnrealFX.FX_TEX_W = 456
@@ -28,8 +27,6 @@ UnrealFX.FX_SPIN_GROW_SECONDS = UnrealFX.FX_GROW_SECONDS
 UnrealFX.FX_SHAKE_SECONDS = 0.65
 UnrealFX.FX_HOLD_SECONDS = 0.25
 UnrealFX.FX_FADE_SECONDS = 1.0
--- Legacy alias used by older call sites / comments.
-UnrealFX.FX_ANIM_SECONDS = UnrealFX.FX_GROW_SECONDS
 UnrealFX.FX_SHAKE_AMP = 20
 UnrealFX.FX_SHAKE_FREQ = 32
 UnrealFX.FX_SHAKE_VERT = 0.55
@@ -625,11 +622,6 @@ function UnrealFX.fallbackFxProjectToSelf(win, fromWorldId)
     return UnrealFX.fallbackFxProjectToWorldId(win, fromWorldId, UnrealFX.getSelfWorldObjNum())
 end
 
--- Back-compat name used by earlier drafts.
-function UnrealFX.fallbackFxAttachToSelf(win, fromWorldId)
-    return UnrealFX.fallbackFxProjectToSelf(win, fromWorldId)
-end
-
 function UnrealFX.markFxDoneWorldId(worldId)
     worldId = tonumber(worldId) or 0
     if worldId == 0 then
@@ -1132,7 +1124,6 @@ function UnrealFX.armCombatWorldObj(worldId, name)
     inst.t = 0
     inst.armKey = UnrealFX.normalizeUnitName(name)
     inst.armName = name
-    inst.detachedForFade = nil
     return true
 end
 
@@ -1453,21 +1444,8 @@ end
 function UnrealFX.announcePlayerDeath(killerName)
     -- Always defeat.wav; FX prefers killer world object, else pending scan / self.
     UnrealFX.logPlaybackKeyword("defeat")
-    if UnrealFX.playKillFx("defeat", killerName, { defeat = true }) then
-        return
-    end
-
-    -- No usable killer name: sticky hostile, else self world object.
-    local last = UnrealFX.lastHostile
-    local lastId = last and (tonumber(last.id) or 0) or 0
-    if lastId ~= 0 then
-        UnrealFX.showFxOnWorldObject("defeat", lastId, {
-            quiet = true,
-            label = UnrealFX.toNarrow(last.name or L""),
-        })
-        return
-    end
-    UnrealFX.showFxOnSelf("defeat", { quiet = true })
+    -- playKillFx resolves the killer, else queues a name scan that ends on hostile/self.
+    UnrealFX.playKillFx("defeat", killerName, { defeat = true })
 end
 
 function UnrealFX.getSelfWorldObjNum()
@@ -1715,10 +1693,6 @@ function UnrealFX.releaseFxInstance(inst)
         if attachedId ~= 0 and type(DetachWindowFromWorldObject) == "function" then
             pcall(DetachWindowFromWorldObject, win, attachedId)
         end
-        -- Detach again with 0-safe no-op if the client already dropped the bind on death.
-        if type(DetachWindowFromWorldObject) == "function" and attachedId ~= 0 then
-            pcall(DetachWindowFromWorldObject, win, attachedId)
-        end
         if type(WindowClearAnchors) == "function" then
             pcall(WindowClearAnchors, win)
         end
@@ -1741,17 +1715,11 @@ function UnrealFX.releaseFxInstance(inst)
     inst.fellBackToSelf = nil
     inst.armKey = nil
     inst.armName = nil
-    inst.screenPinned = nil
-    inst.lastSX = nil
-    inst.lastSY = nil
-    inst.detachedForFade = nil
+    inst.noSelfFallback = nil
+    inst.projectTicks = nil
+    inst.stuckChecked = nil
     UnrealFX.fxFree = UnrealFX.fxFree or {}
     UnrealFX.fxFree[#UnrealFX.fxFree + 1] = inst
-end
-
--- Back-compat name used by older call sites / mental model.
-function UnrealFX.hideFxInstance(inst)
-    UnrealFX.releaseFxInstance(inst)
 end
 
 function UnrealFX.acquireFxInstance(worldId)
@@ -1855,14 +1823,24 @@ function UnrealFX.tickFxInstance(inst, elapsed)
 
     -- Playing FX: chat-bubble projection each tick (no Attach). If the id parks at
     -- screen origin / is off-screen, remount onto current hostile, else self.
-    if inst.useMoveProject then
-        local followId = tonumber(inst.attachedId) or 0
-        if followId ~= 0 then
-            UnrealFX.projectFxToWorldObject(win, followId)
-            if not inst.fellBackToSelf and UnrealFX.isFxWindowStuckAtOrigin(win) then
+    -- The check reads the position the client drew for the PREVIOUS projection, so
+    -- it runs before re-projecting and only once one tick has passed since show.
+    -- Clients without MoveWindowToWorldObject (Attach) get one check.
+    local followId = tonumber(inst.attachedId) or 0
+    if followId ~= 0 then
+        local ticks = inst.projectTicks or 0
+        if ticks >= 1
+            and not inst.fellBackToSelf
+            and not inst.noSelfFallback
+            and (inst.useMoveProject or not inst.stuckChecked)
+        then
+            inst.stuckChecked = true
+            if UnrealFX.isFxWindowStuckAtOrigin(win) then
                 local fb = UnrealFX.fallbackFxProjectToHostileOrSelf(win, followId)
                 if fb ~= 0 then
+                    followId = fb
                     inst.attachedId = fb
+                    UnrealFX.markFxDoneWorldId(fb)
                     local selfId = UnrealFX.getSelfWorldObjNum()
                     if selfId ~= 0 and fb == selfId then
                         inst.fellBackToSelf = true
@@ -1870,13 +1848,16 @@ function UnrealFX.tickFxInstance(inst, elapsed)
                 end
             end
         end
+        if inst.useMoveProject then
+            UnrealFX.projectFxToWorldObject(win, followId)
+        end
+        inst.projectTicks = ticks + 1
     end
 
     local motion = inst.motion or "grow"
     -- Grow and spin share one intro length (spin only adds rotation).
     local growDur = UnrealFX.FX_GROW_SECONDS
         or UnrealFX.FX_SPIN_GROW_SECONDS
-        or UnrealFX.FX_ANIM_SECONDS
         or 0.45
     local shakeDur = UnrealFX.FX_SHAKE_SECONDS or 0.65
     local holdDur = UnrealFX.FX_HOLD_SECONDS or 0.25
@@ -2530,8 +2511,6 @@ function UnrealFX.queuePendingFx(fxKey, unitName, opts)
             p.scanLo = scanLo
             p.scanHi = scanHi
             p.allowSelf = opts.allowSelf == true
-            p.killResolve = opts.killResolve == true
-            p.usedIds = opts.usedIds
             return
         end
     end
@@ -2550,10 +2529,10 @@ function UnrealFX.queuePendingFx(fxKey, unitName, opts)
         scanLo = scanLo,
         scanHi = scanHi,
         allowSelf = opts.allowSelf == true,
-        killResolve = opts.killResolve == true,
-        usedIds = opts.usedIds,
     }
 end
+
+local PENDING_RESOLVE_OPTS = { skipScan = true, skipCapture = true }
 
 function UnrealFX.tickPendingFx(elapsed)
     local queue = UnrealFX.pendingFxQueue
@@ -2567,32 +2546,23 @@ function UnrealFX.tickPendingFx(elapsed)
         local pending = queue[i]
         pending.t = (pending.t or 0) + dt
 
-        local worldId = 0
-        if pending.killResolve then
-            -- Kill path: soft-arm / named hits / dead hostile (not the defeat name-scan).
-            worldId = UnrealFX.resolveWorldObjForKill(pending.want, pending.usedIds)
-        else
-            worldId = UnrealFX.resolveWorldObjForVictim(pending.want, {
-                skipScan = true,
-                skipCapture = true,
-            })
-            if worldId == 0 and type(GetNameForObject) == "function" then
-                local perFrame = UnrealFX.FX_PENDING_SCAN_PER_FRAME or 48
-                local id = pending.scanId or pending.scanLo or 1
-                local hi = pending.scanHi or id
-                for _ = 1, perFrame do
-                    if id > hi then
-                        break
-                    end
-                    local hit = UnrealFX.probeWorldObjName(id, pending.want)
-                    id = id + 1
-                    if hit ~= 0 then
-                        worldId = hit
-                        break
-                    end
+        local worldId = UnrealFX.resolveWorldObjForVictim(pending.want, PENDING_RESOLVE_OPTS)
+        if worldId == 0 and type(GetNameForObject) == "function" then
+            local perFrame = UnrealFX.FX_PENDING_SCAN_PER_FRAME or 48
+            local id = pending.scanId or pending.scanLo or 1
+            local hi = pending.scanHi or id
+            for _ = 1, perFrame do
+                if id > hi then
+                    break
                 end
-                pending.scanId = id
+                local hit = UnrealFX.probeWorldObjName(id, pending.want)
+                id = id + 1
+                if hit ~= 0 then
+                    worldId = hit
+                    break
+                end
             end
+            pending.scanId = id
         end
 
         if worldId ~= 0 then
@@ -2640,11 +2610,6 @@ function UnrealFX.mapSoundKeywordToFxKey(keyword)
 
     -- No matching TGA for this sound - do not show FX.
     return nil
-end
-
--- Back-compat alias.
-function UnrealFX.mapKillTypeToFxKey(killType)
-    return UnrealFX.mapSoundKeywordToFxKey(killType)
 end
 
 function UnrealFX.showFxOnWorldObject(requestedKey, worldId, opts)
@@ -2728,46 +2693,14 @@ function UnrealFX.showFxOnWorldObject(requestedKey, worldId, opts)
 
     local useMove = type(MoveWindowToWorldObject) == "function"
     local attachId = worldId
+    local selfId = UnrealFX.getSelfWorldObjNum()
+    WindowSetShowing(win, true)
     UnrealFX.projectFxToWorldObject(win, attachId)
     if type(ForceUpdateWorldObjectWindow) == "function" then
         pcall(ForceUpdateWorldObjectWindow, attachId, win)
     end
-
-    local selfId = UnrealFX.getSelfWorldObjNum()
-    local fellBack = false
-    if not opts.noSelfFallback
-        and attachId ~= selfId
-        and UnrealFX.isFxWindowStuckAtOrigin(win)
-    then
-        local fb = UnrealFX.fallbackFxProjectToHostileOrSelf(win, attachId)
-        if fb ~= 0 then
-            attachId = fb
-            fellBack = true
-            if opts.label == nil then
-                if selfId ~= 0 and fb == selfId then
-                    opts.label = "player"
-                else
-                    opts.label = "hostile"
-                end
-            end
-        end
-    end
-
-    WindowSetShowing(win, true)
-    UnrealFX.projectFxToWorldObject(win, attachId)
-    if type(ForceUpdateWorldObjectWindow) == "function" and attachId ~= 0 then
-        pcall(ForceUpdateWorldObjectWindow, attachId, win)
-    end
-    if not opts.noSelfFallback
-        and attachId ~= selfId
-        and UnrealFX.isFxWindowStuckAtOrigin(win)
-    then
-        local fb = UnrealFX.fallbackFxProjectToHostileOrSelf(win, attachId)
-        if fb ~= 0 then
-            attachId = fb
-            fellBack = true
-        end
-    end
+    -- The screen position only updates once the client has drawn the projection,
+    -- so the stuck-at-origin check (hostile / self fallback) runs in tickFxInstance.
 
     local motion = UnrealFX.pickFxMotion(opts)
     local spinStart = 0
@@ -2795,28 +2728,17 @@ function UnrealFX.showFxOnWorldObject(requestedKey, worldId, opts)
     inst.t = 0
     inst.armKey = nil
     inst.armName = nil
-    inst.screenPinned = nil
-    inst.lastSX = nil
-    inst.lastSY = nil
-    inst.detachedForFade = nil
-    inst.fellBackToSelf = fellBack or (selfId ~= 0 and attachId == selfId)
+    inst.noSelfFallback = opts.noSelfFallback == true
+    inst.projectTicks = 0
+    inst.stuckChecked = false
+    inst.fellBackToSelf = selfId ~= 0 and attachId == selfId
     -- Block re-arm / re-FX on the intended corpse even if we displayed on self.
     UnrealFX.markFxDoneWorldId(worldId)
-    if attachId ~= worldId then
-        UnrealFX.markFxDoneWorldId(attachId)
-    end
     UnrealFX.consumeCombatHitWorldId(worldId)
     UnrealFX.fxLastKey = entry.key
 
     if not opts.quiet then
         local who = opts.label or ("worldObj " .. tostring(attachId))
-        if fellBack then
-            if selfId ~= 0 and attachId == selfId then
-                who = who .. " (self fallback)"
-            else
-                who = who .. " (hostile fallback)"
-            end
-        end
         local soundNote = ""
         if opts.sound and opts.sound ~= "" then
             soundNote = " + sound '" .. tostring(opts.sound) .. "'"
