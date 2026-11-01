@@ -196,6 +196,12 @@ UnrealFX.FX_DONE_SECONDS = 8.0
 UnrealFX.FX_DAMAGE_PAIR_SECONDS = 3.0
 UnrealFX.FX_DAMAGE_PAIR_MAX = 24
 UnrealFX.FX_DAMAGE_PAIR_CHAT_CANDIDATES = 8
+-- Kill-line ability vs the paired hit's ability (combat log or event abilityId).
+UnrealFX.FX_ABILITY_MATCH_BONUS = 3000
+UnrealFX.FX_ABILITY_MISMATCH_PENALTY = 1500
+-- Combat-log ability vs event abilityId ability on the same pair.
+UnrealFX.FX_PAIR_ABILITY_AGREE_BONUS = 500
+UnrealFX.FX_PAIR_ABILITY_DISAGREE_PENALTY = 800
 -- Fixed rings of reused { id, amount, t, used } / { key, amount, t, used } entries.
 UnrealFX.recentDamageEvents = newEntryRing(UnrealFX.FX_DAMAGE_PAIR_MAX)
 UnrealFX.recentDamageChats = newEntryRing(UnrealFX.FX_DAMAGE_PAIR_MAX)
@@ -804,8 +810,43 @@ function UnrealFX.isUsableVictimWorldId(id, usedIds, avoidId)
     return true
 end
 
--- Outgoing damage event: world id + absolute damage amount. Reuses a ring slot.
-function UnrealFX.rememberRecentDamageEvent(worldId, amount)
+-- Ability names compared as trimmed lowercase narrow strings; nil when unknown.
+function UnrealFX.normalizeAbilityKey(ability)
+    if ability == nil or ability == L"" or ability == "" then
+        return nil
+    end
+    local s = string.lower(UnrealFX.toNarrow(ability))
+    s = string.gsub(s, "^%s+", "")
+    s = string.gsub(s, "%s+$", "")
+    if s == "" then
+        return nil
+    end
+    return s
+end
+
+-- abilityId -> normalized name (false when GetAbilityData has none). Bounded by the
+-- abilities that actually hit something.
+local abilityKeyById = {}
+function UnrealFX.getAbilityKeyById(abilityId)
+    abilityId = tonumber(abilityId) or 0
+    if abilityId <= 0 or type(GetAbilityData) ~= "function" then
+        return nil
+    end
+    local cached = abilityKeyById[abilityId]
+    if cached == nil then
+        cached = false
+        local ok, data = pcall(GetAbilityData, abilityId)
+        if ok and type(data) == "table" then
+            cached = UnrealFX.normalizeAbilityKey(data.name) or false
+        end
+        abilityKeyById[abilityId] = cached
+    end
+    return cached or nil
+end
+
+-- Outgoing damage event: world id + absolute damage amount (+ ability when the event
+-- carries an abilityId). Reuses a ring slot.
+function UnrealFX.rememberRecentDamageEvent(worldId, amount, abilityKey)
     worldId = tonumber(worldId) or 0
     amount = math.abs(tonumber(amount) or 0)
     if worldId == 0 or amount == 0 or worldId == UnrealFX.getPlayerWorldObjNum() then
@@ -814,31 +855,32 @@ function UnrealFX.rememberRecentDamageEvent(worldId, amount)
     local entry = entryRingNext(UnrealFX.recentDamageEvents)
     entry.id = worldId
     entry.amount = amount
+    entry.ability = abilityKey or false
     entry.t = UnrealFX.fxClock or 0
     entry.used = false
 end
 
 -- Combat YOUR_HITS / PET_HITS: "Your X hits Target for N damage."
+-- Returns targetKey, amount, abilityKey (no table, runs on every hit line).
 function UnrealFX.parseOutgoingDamageCombatLog(msg, isPetHit)
     local s = UnrealFX.toNarrow(msg)
     if s == "" then
         return nil
     end
-    local targetName, damageStr
+    local ability, targetName, damageStr
     if isPetHit then
-        local _pet, _ability
-        _pet, _ability, targetName, damageStr =
+        local _pet
+        _pet, ability, targetName, damageStr =
             string.match(s, "^Your (.+)'s (.+) critically hits (.+) for (%d+) damage")
         if targetName == nil then
-            _pet, _ability, targetName, damageStr =
+            _pet, ability, targetName, damageStr =
                 string.match(s, "^Your (.+)'s (.+) hits (.+) for (%d+) damage")
         end
     else
-        local _ability
-        _ability, targetName, damageStr =
+        ability, targetName, damageStr =
             string.match(s, "^Your (.+) critically hits (.+) for (%d+) damage")
         if targetName == nil then
-            _ability, targetName, damageStr =
+            ability, targetName, damageStr =
                 string.match(s, "^Your (.+) hits (.+) for (%d+) damage")
         end
     end
@@ -849,13 +891,10 @@ function UnrealFX.parseOutgoingDamageCombatLog(msg, isPetHit)
     if amount == 0 then
         return nil
     end
-    return {
-        key = UnrealFX.normalizeUnitName(targetName),
-        amount = amount,
-    }
+    return UnrealFX.normalizeUnitName(targetName), amount, UnrealFX.normalizeAbilityKey(ability)
 end
 
-function UnrealFX.rememberRecentDamageChat(nameOrKey, amount)
+function UnrealFX.rememberRecentDamageChat(nameOrKey, amount, abilityKey)
     local key = UnrealFX.normalizeUnitName(nameOrKey)
     amount = math.abs(tonumber(amount) or 0)
     if key == L"" or amount == 0 then
@@ -864,6 +903,7 @@ function UnrealFX.rememberRecentDamageChat(nameOrKey, amount)
     local entry = entryRingNext(UnrealFX.recentDamageChats)
     entry.key = key
     entry.amount = amount
+    entry.ability = abilityKey or false
     entry.t = UnrealFX.fxClock or 0
     entry.used = false
 end
@@ -882,16 +922,17 @@ function UnrealFX.onOutgoingDamageCombatLog(filterType)
         return
     end
     local _, _, msg = TextLogGetEntry("Combat", num)
-    local hit = UnrealFX.parseOutgoingDamageCombatLog(msg, isPet)
-    if not hit then
+    local key, amount, abilityKey = UnrealFX.parseOutgoingDamageCombatLog(msg, isPet)
+    if not key then
         return
     end
-    UnrealFX.rememberRecentDamageChat(hit.key, hit.amount)
+    UnrealFX.rememberRecentDamageChat(key, amount, abilityKey)
 end
 
 -- Score a chat line (name+amount) against a damage event (id+amount). Higher is better.
--- Returns nil if incompatible.
-function UnrealFX.scoreDamagePair(chat, event, wantKey, now)
+-- killAbility: normalized ability from the kill line (nil when unknown). Returns nil if
+-- incompatible. Unknown abilities leave the score unchanged.
+function UnrealFX.scoreDamagePair(chat, event, wantKey, now, killAbility)
     if type(chat) ~= "table" or type(event) ~= "table" then
         return nil
     end
@@ -935,12 +976,30 @@ function UnrealFX.scoreDamagePair(chat, event, wantKey, now)
         end
     end
 
+    local chatAbility = chat.ability or nil
+    local eventAbility = event.ability or nil
+    if chatAbility and eventAbility then
+        if chatAbility == eventAbility then
+            score = score + (UnrealFX.FX_PAIR_ABILITY_AGREE_BONUS or 500)
+        else
+            score = score - (UnrealFX.FX_PAIR_ABILITY_DISAGREE_PENALTY or 800)
+        end
+    end
+    local pairAbility = chatAbility or eventAbility
+    if killAbility and pairAbility then
+        if pairAbility == killAbility then
+            score = score + (UnrealFX.FX_ABILITY_MATCH_BONUS or 3000)
+        else
+            score = score - (UnrealFX.FX_ABILITY_MISMATCH_PENALTY or 1500)
+        end
+    end
+
     return score
 end
 
 -- Among recent damage chats for victimName, pick the best amount-matched event id.
 -- Skip the living current hostile (HP > 0) - that is still targeted, not the corpse.
-function UnrealFX.findBestDamagePairWorldId(victimName, usedIds)
+function UnrealFX.findBestDamagePairWorldId(victimName, usedIds, killAbility)
     local want = UnrealFX.normalizeUnitName(victimName)
     if want == L"" then
         return 0
@@ -963,7 +1022,7 @@ function UnrealFX.findBestDamagePairWorldId(victimName, usedIds)
             end
             for ei = 1, events.count do
                 local event = entryRingAt(events, ei)
-                local score = UnrealFX.scoreDamagePair(chat, event, want, now)
+                local score = UnrealFX.scoreDamagePair(chat, event, want, now, killAbility)
                 if score ~= nil then
                     local id = tonumber(event.id) or 0
                     -- Living current target: keep searching for another pair.
@@ -1033,12 +1092,14 @@ end
 
 -- Kill FX world id. Prefer best damage-event/combat-chat amount+name pair, then
 -- soft-arm / SCT / dead hostile. Self fallback is handled by playKillFx / announce.
-function UnrealFX.resolveWorldObjForKill(victimName, usedIds)
+-- opts (optional): { ability = normalized kill-line ability }.
+function UnrealFX.resolveWorldObjForKill(victimName, usedIds, opts)
     local want = UnrealFX.normalizeUnitName(victimName)
     if want == L"" then
         return 0
     end
     usedIds = usedIds or {}
+    local killAbility = opts and opts.ability or nil
     local avoidId = UnrealFX.getLivingHostileWorldId()
     local combatIds = UnrealFX.collectCombatHitWorldObjsNewestFirst()
 
@@ -1063,7 +1124,7 @@ function UnrealFX.resolveWorldObjForKill(victimName, usedIds)
     end
 
     -- 0) Best YOUR_HITS chat + WORLD_OBJ_COMBAT_EVENT amount pair for this victim.
-    local pairId = UnrealFX.findBestDamagePairWorldId(want, usedIds)
+    local pairId = UnrealFX.findBestDamagePairWorldId(want, usedIds, killAbility)
     if pairId ~= 0 then
         return pairId
     end
@@ -1179,7 +1240,8 @@ function UnrealFX.armCombatWorldObj(worldId, slot)
     return true
 end
 
-function UnrealFX.addKillSpreeVictim(victimName)
+-- ability: normalized kill-line ability (RvR line), nil for PvE / unknown.
+function UnrealFX.addKillSpreeVictim(victimName, ability)
     if victimName == nil or victimName == L"" then
         return 0
     end
@@ -1189,19 +1251,21 @@ function UnrealFX.addKillSpreeVictim(victimName)
         UnrealFX.killSpreeVictims = list
     end
     local used = UnrealFX.collectUsedSpreeWorldIds()
-    local worldId = UnrealFX.resolveWorldObjForKill(victimName, used)
-    list[#list + 1] = {
+    local entry = {
         name = victimName,
-        worldId = worldId,
+        worldId = 0,
+        ability = ability,
     }
-    return worldId
+    entry.worldId = UnrealFX.resolveWorldObjForKill(victimName, used, entry)
+    list[#list + 1] = entry
+    return entry.worldId
 end
 
-function UnrealFX.resetKillSpreeVictims(victimName)
+function UnrealFX.resetKillSpreeVictims(victimName, ability)
     UnrealFX.killSpreeVictims = {}
     UnrealFX.killSpreeFxWorldIds = {}
     if victimName ~= nil and victimName ~= L"" then
-        UnrealFX.addKillSpreeVictim(victimName)
+        UnrealFX.addKillSpreeVictim(victimName, ability)
     end
 end
 
@@ -1249,7 +1313,8 @@ local function rememberKill(key, source, now)
 end
 
 -- source: "rvr" (Combat RvR kill line) or "pve" (Chat "You have slain").
-function UnrealFX.processPlayerKill(victimName, source)
+-- ability: killing ability from the RvR line (any form), nil when unknown.
+function UnrealFX.processPlayerKill(victimName, source, ability)
     if victimName == nil or victimName == L"" then
         return
     end
@@ -1260,11 +1325,12 @@ function UnrealFX.processPlayerKill(victimName, source)
         return
     end
     rememberKill(key, source, now)
+    local abilityKey = UnrealFX.normalizeAbilityKey(ability)
 
     if UnrealFX.killSpree < 1 then
         UnrealFX.killSpree = 1
         UnrealFX.lastKillClock = now
-        UnrealFX.resetKillSpreeVictims(victimName)
+        UnrealFX.resetKillSpreeVictims(victimName, abilityKey)
         UnrealFX.announcePlayerKill(L"firstblood", victimName)
         return
     end
@@ -1274,7 +1340,7 @@ function UnrealFX.processPlayerKill(victimName, source)
 
     if sinceLast >= 0 and sinceLast < KILL_SPREE_WINDOW_SECONDS then
         UnrealFX.killSpree = UnrealFX.killSpree + 1
-        UnrealFX.addKillSpreeVictim(victimName)
+        UnrealFX.addKillSpreeVictim(victimName, abilityKey)
         if UnrealFX.killSpree == 2 then
             -- Sound once; FX on every distinct corpse in the streak.
             UnrealFX.announcePlayerKill(L"doublekill", victimName)
@@ -1286,7 +1352,7 @@ function UnrealFX.processPlayerKill(victimName, source)
     end
 
     UnrealFX.killSpree = 1
-    UnrealFX.resetKillSpreeVictims(victimName)
+    UnrealFX.resetKillSpreeVictims(victimName, abilityKey)
     local killType = NORMAL_KILL_KEYS[math.random(#NORMAL_KILL_KEYS)]
     UnrealFX.announcePlayerKill(killType, victimName)
 end
@@ -1318,7 +1384,8 @@ function UnrealFX.OnCombatHappened(updateType, filterType)
     if msg == nil or msg == L"" then
         return
     end
-    local victim, killer = msg:match(L"([%a]+) has been [%a]+ by ([%a]+)'s [%a%d%p ]+ in [^%.]+.")
+    -- "Victim has been slain by Killer's Ability in Zone." - keep the ability for pairing.
+    local victim, killer, ability = msg:match(L"([%a]+) has been [%a]+ by ([%a]+)'s (.-) in [^%.]+%.")
     if victim == nil or killer == nil or victim == killer then
         return
     end
@@ -1335,7 +1402,7 @@ function UnrealFX.OnCombatHappened(updateType, filterType)
     end
 
     if playerKey ~= L"" and killerKey == playerKey then
-        UnrealFX.processPlayerKill(victim, "rvr")
+        UnrealFX.processPlayerKill(victim, "rvr", ability)
     end
 end
 
@@ -1445,7 +1512,7 @@ function UnrealFX.announcePlayerKill(killType, victimName)
         for i = 1, #victims do
             local entry = victims[i]
             if type(entry) == "table" and not entry.fxShown and (tonumber(entry.worldId) or 0) == 0 then
-                local worldId = UnrealFX.resolveWorldObjForKill(entry.name or victimName, used)
+                local worldId = UnrealFX.resolveWorldObjForKill(entry.name or victimName, used, entry)
                 entry.worldId = worldId
                 if worldId ~= 0 then
                     used[worldId] = true
@@ -1462,7 +1529,7 @@ function UnrealFX.announcePlayerKill(killType, victimName)
                 UnrealFX.markKillSpreeFxShown(entry, worldId)
             else
                 if worldId == 0 then
-                    worldId = UnrealFX.resolveWorldObjForKill(name, seenIds)
+                    worldId = UnrealFX.resolveWorldObjForKill(name, seenIds, entry)
                     entry.worldId = worldId
                 end
                 local shown = false
@@ -2254,7 +2321,10 @@ local function combatHitName(slot, id, now)
     return name, hitRing.key[slot] or nil
 end
 
-function UnrealFX.OnWorldObjCombatEvent(hitTargetObjectNumber, hitAmount, textType)
+-- (hitTargetObjectNumber, hitAmount, textType[, abilityId]). Stock passes three
+-- arguments; a 4th numeric abilityId is used when the client provides one.
+function UnrealFX.OnWorldObjCombatEvent(...)
+    local hitTargetObjectNumber, hitAmount, textType, abilityArg = ...
     -- Data only: remember the hit id, damage amount and (throttled) name. The corpse
     -- keeps this worldObjNum; the kill line later matches by name. No window work.
     local id = tonumber(hitTargetObjectNumber) or 0
@@ -2273,7 +2343,11 @@ function UnrealFX.OnWorldObjCombatEvent(hitTargetObjectNumber, hitAmount, textTy
     end
     hitRing.dmgT[slot] = now
     if amount < 0 then
-        UnrealFX.rememberRecentDamageEvent(id, -amount)
+        local abilityKey = nil
+        if type(abilityArg) == "number" and abilityArg > 0 then
+            abilityKey = UnrealFX.getAbilityKeyById(abilityArg)
+        end
+        UnrealFX.rememberRecentDamageEvent(id, -amount, abilityKey)
     end
 
     local name, key = combatHitName(slot, id, now)
