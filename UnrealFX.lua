@@ -60,6 +60,29 @@ UnrealFX.lastHostile = UnrealFX.lastHostile or { id = 0, name = L"" }
 UnrealFX.recentWorldObjIds = UnrealFX.recentWorldObjIds or {}
 UnrealFX.recentWorldObjIdSet = UnrealFX.recentWorldObjIdSet or {}
 UnrealFX.FX_RECENT_WORLD_OBJ_MAX = 96
+
+-- Target slot lists, built once on first use (TargetInfo may load after this file).
+local hitNameSlots = nil
+local victimNameSlots = nil
+local function getHitNameSlots()
+    if hitNameSlots == nil then
+        hitNameSlots = {
+            (TargetInfo and TargetInfo.HOSTILE_TARGET) or "selfhostiletarget",
+            "mouseovertarget",
+        }
+    end
+    return hitNameSlots
+end
+local function getVictimNameSlots()
+    if victimNameSlots == nil then
+        victimNameSlots = {
+            (TargetInfo and TargetInfo.HOSTILE_TARGET) or "selfhostiletarget",
+            "mouseovertarget",
+            (TargetInfo and TargetInfo.FRIENDLY_TARGET) or "selffriendlytarget",
+        }
+    end
+    return victimNameSlots
+end
 -- No client API maps player name -> entity id. GetNameForObject can reverse-lookup
 -- ids within ~180 yards; we budget-scan known seeds + a local id window.
 UnrealFX.FX_NAME_SCAN_BUDGET = 120
@@ -256,8 +279,14 @@ FirstBloodTime = 0
 UnrealFX.killSpreeVictims = UnrealFX.killSpreeVictims or {}
 -- World ids that already received kill FX in the current streak (no re-stamp).
 UnrealFX.killSpreeFxWorldIds = UnrealFX.killSpreeFxWorldIds or {}
--- Newest-last combat hits with names - needed when many identical PVE mobs die.
-UnrealFX.recentNamedHits = UnrealFX.recentNamedHits or {}
+-- Recent combat hits with names - needed when many identical PVE mobs die.
+-- Fixed-size ring buffer: entry tables are reused, one live entry per world id.
+-- Read newest-first with UnrealFX.getRecentNamedHit(k) for k = 1..getRecentNamedHitCount().
+local NAMED_HIT_CAP = 96
+local namedHitRing = {}       -- slot (1..NAMED_HIT_CAP) -> entry table
+local namedHitHead = 0        -- slot of the newest entry
+local namedHitCount = 0
+local namedHitSlotById = {}   -- world id -> slot of its live entry
 
 function UnrealFX.Initialize()
     local version = UnrealFX.VERSION or "?"
@@ -359,13 +388,10 @@ function UnrealFX.shouldSkipPveVictim(victimName)
         return true
     end
 
-    local hits = UnrealFX.recentNamedHits
-    if type(hits) == "table" then
-        for i = #hits, 1, -1 do
-            local hit = hits[i]
-            if hit and hit.key == want and UnrealFX.isLikelyPlayerPetMeta(hit) then
-                return true
-            end
+    for k = 1, namedHitCount do
+        local hit = UnrealFX.getRecentNamedHit(k)
+        if hit and hit.id ~= 0 and hit.key == want and UnrealFX.isLikelyPlayerPetMeta(hit) then
+            return true
         end
     end
     return false
@@ -377,19 +403,36 @@ function UnrealFX.rememberRecentNamedHit(worldObjNum, name, meta)
     if id == 0 or key == L"" then
         return
     end
-    local list = UnrealFX.recentNamedHits
-    if type(list) ~= "table" then
-        list = {}
-        UnrealFX.recentNamedHits = list
-    end
     -- Keep a single newest entry per world id so target polling cannot bury combat hits.
-    for i = #list, 1, -1 do
-        if list[i] and (tonumber(list[i].id) or 0) == id then
-            table.remove(list, i)
-            break
+    local oldSlot = namedHitSlotById[id]
+    if oldSlot then
+        local old = namedHitRing[oldSlot]
+        if old then
+            old.id = 0
         end
+        namedHitSlotById[id] = nil
     end
-    local entry = { id = id, key = key, fromCombat = false }
+
+    namedHitHead = (namedHitHead % NAMED_HIT_CAP) + 1
+    local entry = namedHitRing[namedHitHead]
+    if entry == nil then
+        entry = {}
+        namedHitRing[namedHitHead] = entry
+    elseif entry.id ~= 0 and namedHitSlotById[entry.id] == namedHitHead then
+        namedHitSlotById[entry.id] = nil
+    end
+    if namedHitCount < NAMED_HIT_CAP then
+        namedHitCount = namedHitCount + 1
+    end
+
+    entry.id = id
+    entry.key = key
+    entry.consumed = false
+    entry.fromCombat = false
+    entry.isPvP = nil
+    entry.isNPC = nil
+    entry.career = 0
+    entry.unitType = nil
     if type(meta) == "table" then
         entry.fromCombat = meta.fromCombat == true
         entry.isPvP = meta.isPvP == true
@@ -397,11 +440,19 @@ function UnrealFX.rememberRecentNamedHit(worldObjNum, name, meta)
         entry.career = tonumber(meta.career) or 0
         entry.unitType = meta.unitType
     end
-    list[#list + 1] = entry
-    local maxN = UnrealFX.FX_RECENT_WORLD_OBJ_MAX or 96
-    while #list > maxN do
-        table.remove(list, 1)
+    namedHitSlotById[id] = namedHitHead
+end
+
+function UnrealFX.getRecentNamedHitCount()
+    return namedHitCount
+end
+
+-- k = 1 is the newest entry. Entries with id == 0 were superseded; skip them.
+function UnrealFX.getRecentNamedHit(k)
+    if k < 1 or k > namedHitCount then
+        return nil
     end
+    return namedHitRing[((namedHitHead - k) % NAMED_HIT_CAP) + 1]
 end
 
 function UnrealFX.getPlayerWorldObjNum()
@@ -464,15 +515,10 @@ function UnrealFX.consumeCombatHitWorldId(worldId)
     if worldId == 0 then
         return
     end
-    local hits = UnrealFX.recentNamedHits
-    if type(hits) ~= "table" then
-        return
-    end
-    for i = 1, #hits do
-        local hit = hits[i]
-        if hit and (tonumber(hit.id) or 0) == worldId then
-            hit.consumed = true
-        end
+    local slot = namedHitSlotById[worldId]
+    local hit = slot and namedHitRing[slot]
+    if hit and hit.id == worldId then
+        hit.consumed = true
     end
 end
 
@@ -859,7 +905,7 @@ function UnrealFX.findBestDamagePairWorldId(victimName, usedIds)
     return id
 end
 
--- Newest-first. Does not touch recentNamedHits (avoids reordering / target pollution).
+-- Newest-first. Does not touch the named-hit ring (avoids reordering / target pollution).
 function UnrealFX.collectCombatHitWorldObjsNewestFirst()
     local ordered = {}
     local orderedSeen = {}
@@ -946,19 +992,16 @@ function UnrealFX.resolveWorldObjForKill(victimName, usedIds)
     end
 
     -- 2) Named combat hits learned while alive (unconsumed), newest first.
-    local hits = UnrealFX.recentNamedHits
     local namedAvoidMatch = 0
-    if type(hits) == "table" then
-        for i = #hits, 1, -1 do
-            local hit = hits[i]
-            if hit and hit.fromCombat and not hit.consumed and hit.key == want then
-                local id = tonumber(hit.id) or 0
-                if usable(id, false) then
-                    return id
-                end
-                if namedAvoidMatch == 0 and avoidId ~= 0 and id == avoidId and usable(id, true) then
-                    namedAvoidMatch = id
-                end
+    for k = 1, namedHitCount do
+        local hit = UnrealFX.getRecentNamedHit(k)
+        if hit and hit.id ~= 0 and hit.fromCombat and not hit.consumed and hit.key == want then
+            local id = hit.id
+            if usable(id, false) then
+                return id
+            end
+            if namedAvoidMatch == 0 and avoidId ~= 0 and id == avoidId and usable(id, true) then
+                namedAvoidMatch = id
             end
         end
     end
@@ -1034,14 +1077,14 @@ function UnrealFX.armCombatWorldObj(worldId, name)
 
     local existing = UnrealFX.findFxInstanceByWorldId(worldId)
     if existing then
+        -- Already bound to this id: just keep the arm alive. No Detach/Attach,
+        -- alpha or show calls -- the window is already hidden at alpha 0.
         if existing.phase == "armed" then
             existing.t = 0
-            existing.armKey = UnrealFX.normalizeUnitName(name)
-            existing.armName = name
-            UnrealFX.rebindFxToWorldObject(existing.win, worldId)
-            UnrealFX.setFxAlpha(existing.win, existing.image or (existing.win .. "Image"), 0)
-            WindowSetShowing(existing.win, false)
-            return true
+            if name and name ~= L"" and existing.armName ~= name then
+                existing.armKey = UnrealFX.normalizeUnitName(name)
+                existing.armName = name
+            end
         end
         return true
     end
@@ -1059,7 +1102,7 @@ function UnrealFX.armCombatWorldObj(worldId, name)
         inst.attachedId = nil
     end
 
-    UnrealFX.setFxAlpha(win, image, 0)
+    UnrealFX.setFxAlpha(win, image, 0, inst)
     WindowSetShowing(win, false)
     UnrealFX.rebindFxToWorldObject(win, worldId)
 
@@ -1517,12 +1560,20 @@ function UnrealFX.computeFxGrowScale(u)
     return peakS + (1.0 - peakS) * e
 end
 
-function UnrealFX.setFxAlpha(win, image, alpha)
+-- Pass the pool instance as `inst` to skip the client calls when its alpha is
+-- already at the requested value (e.g. hidden armed windows, the hold phase).
+function UnrealFX.setFxAlpha(win, image, alpha, inst)
     alpha = tonumber(alpha) or 0
     if alpha < 0 then
         alpha = 0
     elseif alpha > 1 then
         alpha = 1
+    end
+    if inst then
+        if inst.alpha == alpha then
+            return
+        end
+        inst.alpha = alpha
     end
     if win and DoesWindowExist(win) then
         WindowSetAlpha(win, alpha)
@@ -1612,7 +1663,9 @@ function UnrealFX.releaseFxInstance(inst)
         end
         UnrealFX.resetFxMotionVisuals(win)
         -- Alpha 0 (not 1): after death the client leaves the window Showing; alpha 1 = hang.
-        UnrealFX.setFxAlpha(win, image, 0)
+        -- Free-pool windows are hidden here once; nothing re-hides them per frame.
+        inst.alpha = nil
+        UnrealFX.setFxAlpha(win, image, 0, inst)
         WindowSetShowing(win, false)
     end
 
@@ -1729,8 +1782,9 @@ function UnrealFX.tickFxInstance(inst, elapsed)
 
     -- Soft-armed (hidden) bind from a combat hit - expire if no kill promotes it.
     if inst.phase == "armed" then
-        -- Client forces Showing while attached; keep alpha 0 so it cannot "hang" opaque.
-        UnrealFX.setFxAlpha(win, image, 0)
+        -- Client forces Showing while attached; alpha stays 0 so it cannot "hang" opaque.
+        -- (Cached: no client call once the window is already at 0.)
+        UnrealFX.setFxAlpha(win, image, 0, inst)
         local armDur = UnrealFX.FX_ARM_SECONDS or 5.0
         if t >= armDur then
             return false
@@ -1811,7 +1865,7 @@ function UnrealFX.tickFxInstance(inst, elapsed)
                 UnrealFX.setFxImageRotation(image, 0)
             end
         end
-        UnrealFX.setFxAlpha(win, image, 1.0)
+        UnrealFX.setFxAlpha(win, image, 1.0, inst)
         return true
     end
 
@@ -1847,7 +1901,7 @@ function UnrealFX.tickFxInstance(inst, elapsed)
                 WindowSetScale(image, scale)
             end
         end
-        UnrealFX.setFxAlpha(win, image, 1.0)
+        UnrealFX.setFxAlpha(win, image, 1.0, inst)
         return true
     end
 
@@ -1859,7 +1913,7 @@ function UnrealFX.tickFxInstance(inst, elapsed)
     -- 3) Brief still hold at configured scale.
     if t < holdEnd then
         inst.phase = "hold"
-        UnrealFX.setFxAlpha(win, image, 1.0)
+        UnrealFX.setFxAlpha(win, image, 1.0, inst)
         return true
     end
 
@@ -1871,7 +1925,7 @@ function UnrealFX.tickFxInstance(inst, elapsed)
     elseif fadeT > 1 then
         fadeT = 1
     end
-    UnrealFX.setFxAlpha(win, image, 1.0 - fadeT)
+    UnrealFX.setFxAlpha(win, image, 1.0 - fadeT, inst)
     return true
 end
 
@@ -1884,7 +1938,10 @@ function UnrealFX.OnFxUpdate(timePassed)
 
     UnrealFX.tickPendingFx(elapsed)
 
-    local active = UnrealFX.fxActive or {}
+    local active = UnrealFX.fxActive
+    if active == nil then
+        return
+    end
     local i = 1
     while i <= #active do
         local inst = active[i]
@@ -1897,19 +1954,6 @@ function UnrealFX.OnFxUpdate(timePassed)
             UnrealFX.releaseFxInstance(inst)
         else
             i = i + 1
-        end
-    end
-
-    -- Belt-and-braces: free-pool windows must stay hidden (client attach can revive them).
-    local free = UnrealFX.fxFree
-    if type(free) == "table" then
-        for fi = 1, #free do
-            local inst = free[fi]
-            local win = inst and inst.win
-            if win and DoesWindowExist(win) then
-                UnrealFX.setFxAlpha(win, inst.image or (win .. "Image"), 0)
-                WindowSetShowing(win, false)
-            end
         end
     end
 end
@@ -2080,7 +2124,7 @@ function UnrealFX.captureHostileTarget()
         career = meta.career,
         unitType = meta.unitType,
     }
-    -- Do NOT feed target selection into recentNamedHits / worldObjByName - that made
+    -- Do NOT feed target selection into the named-hit ring / worldObjByName - that made
     -- kill FX stick to a distant living target when AOE killed same-named mobs nearby.
 end
 
@@ -2088,6 +2132,8 @@ function UnrealFX.OnPlayerTargetUpdated(targetClassification, targetId, targetTy
     -- Always refresh from TargetInfo; targetId alone is unreliable on some ticks.
     UnrealFX.captureHostileTarget()
 end
+
+local COMBAT_HIT_META = { fromCombat = true }
 
 function UnrealFX.OnWorldObjCombatEvent(hitTargetObjectNumber, hitAmount, textType)
     -- Same as GroupIcons learning roster worldObjNums while alive: remember + soft-arm
@@ -2100,7 +2146,11 @@ function UnrealFX.OnWorldObjCombatEvent(hitTargetObjectNumber, hitAmount, textTy
     UnrealFX.rememberRecentWorldObjId(id)
 
     -- Outgoing damage (negative amount) for YOUR_HITS chat pairing on kill resolve.
+    -- Heals (positive) never produce a kill victim: stop before the name lookup.
     local amount = tonumber(hitAmount) or 0
+    if amount > 0 then
+        return
+    end
     if amount < 0 then
         UnrealFX.rememberRecentDamageEvent(id, -amount)
     end
@@ -2114,10 +2164,7 @@ function UnrealFX.OnWorldObjCombatEvent(hitTargetObjectNumber, hitAmount, textTy
     end
     -- Hostile/mouseover often has the name when GetNameForObject is empty on the hit tick.
     if (name == nil or name == L"") and TargetInfo and type(TargetInfo.UnitEntityId) == "function" then
-        local slots = {
-            TargetInfo.HOSTILE_TARGET or "selfhostiletarget",
-            "mouseovertarget",
-        }
+        local slots = getHitNameSlots()
         for i = 1, #slots do
             local slot = slots[i]
             if (tonumber(TargetInfo:UnitEntityId(slot)) or 0) == id then
@@ -2132,10 +2179,13 @@ function UnrealFX.OnWorldObjCombatEvent(hitTargetObjectNumber, hitAmount, textTy
 
     if name and name ~= L"" then
         UnrealFX.rememberWorldObjName(id, name)
-        UnrealFX.rememberRecentNamedHit(id, name, { fromCombat = true })
+        UnrealFX.rememberRecentNamedHit(id, name, COMBAT_HIT_META)
     end
 
-    UnrealFX.armCombatWorldObj(id, name)
+    -- Only soft-arm on actual damage; misses/blocks (amount 0) just feed the caches.
+    if amount < 0 then
+        UnrealFX.armCombatWorldObj(id, name)
+    end
 end
 
 function UnrealFX.probeWorldObjName(id, want)
@@ -2326,11 +2376,7 @@ function UnrealFX.resolveWorldObjForVictim(victimName, opts)
     if not opts.skipCurrentTarget
         and TargetInfo and type(TargetInfo.UnitName) == "function" and type(TargetInfo.UnitEntityId) == "function"
     then
-        local slots = {
-            TargetInfo.HOSTILE_TARGET or "selfhostiletarget",
-            "mouseovertarget",
-            TargetInfo.FRIENDLY_TARGET or "selffriendlytarget",
-        }
+        local slots = getVictimNameSlots()
         for i = 1, #slots do
             local slot = slots[i]
             local name = TargetInfo:UnitName(slot)
@@ -2616,7 +2662,8 @@ function UnrealFX.showFxOnWorldObject(requestedKey, worldId, opts)
         end
     end
     UnrealFX.resetFxMotionVisuals(win)
-    UnrealFX.setFxAlpha(win, image, 1.0)
+    inst.alpha = nil
+    UnrealFX.setFxAlpha(win, image, 1.0, inst)
 
     local useMove = type(MoveWindowToWorldObject) == "function"
     local attachId = worldId
