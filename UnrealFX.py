@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""UnrealFX helper (Python) — watch logs/UnrealFX.log and play WAVs.
+"""UnrealFX helper (Python) - watch logs/UnrealFX.log and play WAVs.
 
 Replaces the AutoIt tray exe so OBS Application Audio Capture can bind a real window
 on this process (title: UnrealFX). Stdlib only (winsound + tkinter).
@@ -20,8 +20,11 @@ sys.dont_write_bytecode = True
 VOLUME_PERCENT = 15  # matches legacy AutoIt SoundSetWaveVolume(15)
 # FX is instant in-game; keep this low so WAV pickup stays close to the overlay.
 POLL_SECONDS = 0.05
-# tasklist is expensive — only re-check WAR process on this cadence.
-WAR_PROCESS_CHECK_SECONDS = 1.0
+# tasklist is expensive (spawns a process): only re-check the WAR client on this cadence.
+WAR_PROCESS_CHECK_SECONDS = 5.0
+# A trailing line without a newline is played once the file has been quiet this long.
+PARTIAL_LINE_FLUSH_SECONDS = 0.15
+WAR_IMAGE_NAMES = ("war.exe", "war-64.exe")
 WINDOW_TITLE = "UnrealFX"
 
 
@@ -47,13 +50,16 @@ def find_game_root(start_dir: str) -> str:
     return fallback
 
 
-def war_client_running() -> bool:
-    try:
-        import subprocess
+def war_client_pids() -> set[int]:
+    """PIDs of WAR.exe / WAR-64.exe from one filtered tasklist call."""
+    import subprocess
 
+    pids: set[int] = set()
+    try:
         creation = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         proc = subprocess.run(
-            ["tasklist", "/FO", "CSV", "/NH"],
+            # Server-side filter keeps the output to the few WAR* rows.
+            ["tasklist", "/FI", "IMAGENAME eq WAR*", "/FO", "CSV", "/NH"],
             capture_output=True,
             text=True,
             check=False,
@@ -61,29 +67,102 @@ def war_client_running() -> bool:
             creationflags=creation,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return False
-    text = (proc.stdout or "").lower()
-    return '"war.exe"' in text or '"war-64.exe"' in text
+        return pids
+    for row in (proc.stdout or "").splitlines():
+        # "WAR-64.exe","1234",...
+        parts = [p.strip().strip('"') for p in row.split(",")]
+        if len(parts) >= 2 and parts[0].lower() in WAR_IMAGE_NAMES and parts[1].isdigit():
+            pids.add(int(parts[1]))
+    return pids
 
 
-def read_log_lines(path: str) -> list[str]:
-    if not os.path.isfile(path):
-        return []
-    data: bytes
-    try:
-        with open(path, "rb") as handle:
-            data = handle.read()
-    except OSError:
-        return []
-    if not data:
-        return []
-    text: str
-    if data.startswith(b"\xff\xfe") or data.startswith(b"\xfe\xff"):
-        text = data.decode("utf-16", errors="replace")
-    else:
-        text = data.decode("utf-8", errors="replace")
-    # Keep blank lines so counts match Mythic TextLog / legacy AutoIt _FileCountLines.
-    return text.splitlines()
+def war_client_running() -> bool:
+    return bool(war_client_pids())
+
+
+class LogTail:
+    """Follow a growing text log by byte offset (only new bytes are read).
+
+    The offset resets to 0 when the file shrinks (log recreated) and to the
+    current end when following (re)starts, so old entries are never replayed.
+    UTF-16 logs (BOM) are decoded incrementally; others as UTF-8.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.offset: int | None = None
+        self.decoder = None
+        self.pending = ""
+        self.skip_to_newline = False
+        self.last_growth = 0.0
+
+    def stop(self) -> None:
+        self.offset = None
+
+    def _size(self) -> int:
+        try:
+            return int(os.stat(self.path).st_size)
+        except OSError:
+            return -1
+
+    def _reset(self, offset: int) -> None:
+        import codecs
+
+        encoding = "utf-8"
+        bom = 0
+        try:
+            with open(self.path, "rb") as handle:
+                head = handle.read(3)
+        except OSError:
+            head = b""
+        if head.startswith(b"\xff\xfe"):
+            encoding, bom = "utf-16-le", 2
+        elif head.startswith(b"\xfe\xff"):
+            encoding, bom = "utf-16-be", 2
+        elif head.startswith(b"\xef\xbb\xbf"):
+            bom = 3
+        if offset < bom:
+            offset = bom
+        elif bom == 2 and (offset - bom) % 2:
+            offset -= 1  # keep UTF-16 code units aligned
+        self.offset = offset
+        self.decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+        self.pending = ""
+        self.skip_to_newline = False
+
+    def poll(self, now: float) -> list[str]:
+        size = self._size()
+        if size < 0:
+            return []
+        if self.offset is None:
+            self._reset(size)  # start at the end: do not replay old entries
+            self.last_growth = now
+            return []
+        if size < self.offset:
+            self._reset(0)  # file was recreated / truncated
+        lines: list[str] = []
+        if size > self.offset:
+            try:
+                with open(self.path, "rb") as handle:
+                    handle.seek(self.offset)
+                    data = handle.read(size - self.offset)
+            except OSError:
+                return []
+            self.offset += len(data)
+            self.last_growth = now
+            text = self.pending + self.decoder.decode(data)
+            parts = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            self.pending = parts.pop()
+            if self.skip_to_newline and parts:
+                parts.pop(0)  # rest of a line already played as a partial
+                self.skip_to_newline = False
+            lines.extend(parts)
+        elif self.pending and now - self.last_growth >= PARTIAL_LINE_FLUSH_SECONDS:
+            if not self.skip_to_newline:
+                lines.append(self.pending)
+            self.pending = ""
+            self.skip_to_newline = True
+        return lines
 
 
 def wav_for_line(addon: str, line: str) -> str | None:
@@ -105,12 +184,12 @@ def wav_for_line(addon: str, line: str) -> str | None:
 
 
 def set_wave_volume(percent: int) -> None:
-    """Best-effort waveOut volume (0–100), same intent as AutoIt SoundSetWaveVolume."""
+    """Best-effort waveOut volume (0-100), same intent as AutoIt SoundSetWaveVolume."""
     try:
         import ctypes
 
         level = max(0, min(100, int(percent)))
-        # waveOut volume is 0x0000–0xFFFF per channel, packed as DWORD.
+        # waveOut volume is 0x0000-0xFFFF per channel, packed as DWORD.
         word = int(round(level / 100.0 * 0xFFFF)) & 0xFFFF
         value = (word << 16) | word
         ctypes.windll.winmm.waveOutSetVolume(0, value)
@@ -149,27 +228,7 @@ def flash_game_window() -> None:
                 ("dwTimeout", wintypes.DWORD),
             ]
 
-        pids: set[int] = set()
-        try:
-            import subprocess
-
-            creation = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            for image in ("WAR-64.exe", "WAR.exe"):
-                out = subprocess.run(
-                    ["tasklist", "/FI", f"IMAGENAME eq {image}", "/FO", "CSV", "/NH"],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=10,
-                    creationflags=creation,
-                )
-                for row in (out.stdout or "").splitlines():
-                    # "WAR-64.exe","1234",...
-                    parts = [p.strip().strip('"') for p in row.split(",")]
-                    if len(parts) >= 2 and parts[1].isdigit():
-                        pids.add(int(parts[1]))
-        except Exception:
-            return
+        pids = war_client_pids()
         if not pids:
             return
 
@@ -231,11 +290,9 @@ def create_obs_window(on_ready) -> None:
 
 
 def monitor_loop(addon: str, log_path: str, stop_event: threading.Event) -> None:
-    line_count = len(read_log_lines(log_path))
+    tail = LogTail(log_path)
     war_running = False
     next_war_check = 0.0
-    last_size = -1
-    last_mtime_ns = -1
     while not stop_event.is_set():
         now = time.monotonic()
         if now >= next_war_check:
@@ -243,43 +300,16 @@ def monitor_loop(addon: str, log_path: str, stop_event: threading.Event) -> None
             next_war_check = now + WAR_PROCESS_CHECK_SECONDS
 
         if not war_running:
-            line_count = 0
-            last_size = -1
-            last_mtime_ns = -1
+            tail.stop()  # next session starts at the end of the log
             stop_event.wait(POLL_SECONDS)
             continue
 
-        try:
-            st = os.stat(log_path)
-            size = int(st.st_size)
-            mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000)))
-        except OSError:
-            size = -1
-            mtime_ns = -1
-
-        if size == last_size and mtime_ns == last_mtime_ns:
-            stop_event.wait(POLL_SECONDS)
-            continue
-
-        last_size = size
-        last_mtime_ns = mtime_ns
-        lines = read_log_lines(log_path)
-        current = len(lines)
-
-        if line_count > 1 and current == 0:
-            line_count = current
-        if line_count == 0 and current > 1:
-            line_count = current
-
-        if current > line_count:
-            for idx in range(line_count, current):
-                line = lines[idx]
-                wav = wav_for_line(addon, line)
-                if wav:
-                    play_wav(wav)
-                    if "scenariopop" in line.lower():
-                        flash_game_window()
-            line_count = current
+        for line in tail.poll(now):
+            wav = wav_for_line(addon, line)
+            if wav:
+                play_wav(wav)
+                if "scenariopop" in line.lower():
+                    flash_game_window()
 
         stop_event.wait(POLL_SECONDS)
 
