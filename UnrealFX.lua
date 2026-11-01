@@ -275,7 +275,7 @@ UnrealFX.PULL_ALERT_MIN_LEVEL = 40
 -- Kill streak state (formerly the PlayerName / KillSpree / FirstBloodTime globals).
 UnrealFX.playerNameKey = L""   -- normalizeUnitName(GameData.Player.name), set in Initialize
 UnrealFX.killSpree = 0
-UnrealFX.firstBloodTime = 0
+UnrealFX.lastKillClock = 0     -- UnrealFX.fxClock of the previous kill (monotonic)
 -- Victims in the current <5s kill streak: { name=, worldId=, fxShown= } (duplicate NPC names allowed).
 UnrealFX.killSpreeVictims = UnrealFX.killSpreeVictims or {}
 -- World ids that already received kill FX in the current streak (no re-stamp).
@@ -1162,61 +1162,90 @@ function UnrealFX.resetUnrealFX.killSpreeVictims(victimName)
     end
 end
 
-function UnrealFX.processPlayerKill(victimName, currenttime)
+-- A streak continues while each kill lands within this many seconds of the last.
+local KILL_SPREE_WINDOW_SECONDS = 5
+-- The same victim reported by both the RvR kill line and "You have slain X!"
+-- within this window is one kill.
+local KILL_DEDUPE_SECONDS = 2
+local NORMAL_KILL_KEYS = {
+    L"annihilation", L"erradication", L"extermination", L"godlike",
+    L"headshot", L"dominating", L"denied", L"wickedsick",
+}
+local MULTI_KILL_KEYS = {
+    L"bloodbath", L"holyshit", L"killingspree", L"ludicrous", L"megakill",
+    L"monsterkill1", L"monsterkill2", L"multikill", L"rampage", L"slaughter", L"unstoppable",
+}
+
+-- Small reused ring of recent kills: { key = normalized name, t = fxClock, source = "rvr"|"pve" }.
+local RECENT_KILL_CAP = 8
+local recentKills = {}
+local recentKillHead = 0
+
+-- True when the other kill path already reported this victim moments ago.
+-- Same-path repeats are real kills (e.g. several identically named mobs).
+local function isDuplicateKill(key, source, now)
+    for i = 1, RECENT_KILL_CAP do
+        local k = recentKills[i]
+        if k and k.source ~= source and k.key == key and (now - k.t) <= KILL_DEDUPE_SECONDS then
+            return true
+        end
+    end
+    return false
+end
+
+local function rememberKill(key, source, now)
+    recentKillHead = (recentKillHead % RECENT_KILL_CAP) + 1
+    local k = recentKills[recentKillHead]
+    if k == nil then
+        k = {}
+        recentKills[recentKillHead] = k
+    end
+    k.key = key
+    k.t = now
+    k.source = source
+end
+
+-- source: "rvr" (Combat RvR kill line) or "pve" (Chat "You have slain").
+function UnrealFX.processPlayerKill(victimName, source)
     if victimName == nil or victimName == L"" then
         return
     end
 
-    local normalKillTable = {
-        L"annihilation", L"erradication", L"extermination", L"godlike",
-        L"headshot", L"dominating", L"denied", L"wickedsick",
-    }
-    local multiKillTable = {
-        L"bloodbath", L"holyshit", L"killingspree", L"ludicrous", L"megakill",
-        L"monsterkill1", L"monsterkill2", L"multikill", L"rampage", L"slaughter", L"unstoppable",
-    }
+    local now = UnrealFX.fxClock or 0
+    local key = UnrealFX.normalizeUnitName(victimName)
+    if isDuplicateKill(key, source, now) then
+        return
+    end
+    rememberKill(key, source, now)
 
     if UnrealFX.killSpree < 1 then
-        UnrealFX.killSpree = UnrealFX.killSpree + 1
-        UnrealFX.firstBloodTime = currenttime
-        UnrealFX.resetUnrealFX.killSpreeVictims(victimName)
+        UnrealFX.killSpree = 1
+        UnrealFX.lastKillClock = now
+        UnrealFX.resetKillSpreeVictims(victimName)
         UnrealFX.announcePlayerKill(L"firstblood", victimName)
         return
     end
 
-    local hours, mins, secs = currenttime:match(L"([0-9]+):([0-9]+):([0-9]+)")
-    local fbhours, fbmins, fbsecs = UnrealFX.firstBloodTime:match(L"([0-9]+):([0-9]+):([0-9]+)")
-    local fbhoursinsec = tonumber(fbhours) * 3600
-    local fbminutesinsec = tonumber(fbmins) * 60
-    local fbsecsnum = tonumber(fbsecs) or 0
-    local fbtotalsec = fbhoursinsec + fbminutesinsec + fbsecsnum
-    local choursinsec = tonumber(hours) * 3600
-    local cminutesinsec = tonumber(mins) * 60
-    local secsnum = tonumber(secs) or 0
-    local ctotalinsec = choursinsec + cminutesinsec + secsnum
-    local diffsecs = ctotalinsec - fbtotalsec
+    local sinceLast = now - (UnrealFX.lastKillClock or 0)
+    UnrealFX.lastKillClock = now
 
-    if diffsecs < 5 then
+    if sinceLast >= 0 and sinceLast < KILL_SPREE_WINDOW_SECONDS then
         UnrealFX.killSpree = UnrealFX.killSpree + 1
-        UnrealFX.addUnrealFX.killSpreeVictim(victimName)
-        UnrealFX.firstBloodTime = currenttime
+        UnrealFX.addKillSpreeVictim(victimName)
         if UnrealFX.killSpree == 2 then
             -- Sound once; FX on every distinct corpse in the streak.
             UnrealFX.announcePlayerKill(L"doublekill", victimName)
             return
         end
-        if UnrealFX.killSpree > 2 then
-            local killType = multiKillTable[math.random(#multiKillTable)]
-            UnrealFX.announcePlayerKill(killType, victimName)
-            return
-        end
-    else
-        UnrealFX.killSpree = 1
-        UnrealFX.firstBloodTime = currenttime
-        UnrealFX.resetUnrealFX.killSpreeVictims(victimName)
-        local killType = normalKillTable[math.random(#normalKillTable)]
+        local killType = MULTI_KILL_KEYS[math.random(#MULTI_KILL_KEYS)]
         UnrealFX.announcePlayerKill(killType, victimName)
+        return
     end
+
+    UnrealFX.killSpree = 1
+    UnrealFX.resetKillSpreeVictims(victimName)
+    local killType = NORMAL_KILL_KEYS[math.random(#NORMAL_KILL_KEYS)]
+    UnrealFX.announcePlayerKill(killType, victimName)
 end
 
 function UnrealFX.OnCombatHappened(updateType, filterType)
@@ -1239,10 +1268,15 @@ function UnrealFX.OnCombatHappened(updateType, filterType)
     end
 
     local num = TextLogGetNumEntries("Combat") - 1
-    local currenttime, _, msg = TextLogGetEntry("Combat", num)
+    if num < 0 then
+        return
+    end
+    local _time, _filter, msg = TextLogGetEntry("Combat", num)
+    if msg == nil or msg == L"" then
+        return
+    end
     local victim, killer = msg:match(L"([%a]+) has been [%a]+ by ([%a]+)'s [%a%d%p ]+ in [^%.]+.")
-
-    if victim == killer then
+    if victim == nil or killer == nil or victim == killer then
         return
     end
 
@@ -1258,7 +1292,7 @@ function UnrealFX.OnCombatHappened(updateType, filterType)
     end
 
     if playerKey ~= L"" and killerKey == playerKey then
-        UnrealFX.processPlayerKill(victim, currenttime)
+        UnrealFX.processPlayerKill(victim, "rvr")
     end
 end
 
@@ -1282,9 +1316,12 @@ function UnrealFX.OnChatKillHappened(updateType, filterType)
         return
     end
 
-    local currenttime, _, msg = TextLogGetEntry("Chat", num)
+    local _time, _filter, msg = TextLogGetEntry("Chat", num)
+    if msg == nil or msg == L"" then
+        return
+    end
     -- PVE kill confirm: "You have slain Training Construct!"
-    local victim = msg and msg:match(L"You have slain (.+)!")
+    local victim = msg:match(L"You have slain (.+)!")
     if victim == nil or victim == L"" then
         return
     end
@@ -1292,7 +1329,7 @@ function UnrealFX.OnChatKillHappened(updateType, filterType)
         return
     end
 
-    UnrealFX.processPlayerKill(victim, currenttime)
+    UnrealFX.processPlayerKill(victim, "pve")
 end
 
 function UnrealFX.logDeathBlow(killType)
