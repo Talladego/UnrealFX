@@ -1162,7 +1162,7 @@ function UnrealFX.armCombatWorldObj(worldId, name)
     return true
 end
 
-function UnrealFX.addUnrealFX.killSpreeVictim(victimName)
+function UnrealFX.addKillSpreeVictim(victimName)
     if victimName == nil or victimName == L"" then
         return 0
     end
@@ -1180,11 +1180,11 @@ function UnrealFX.addUnrealFX.killSpreeVictim(victimName)
     return worldId
 end
 
-function UnrealFX.resetUnrealFX.killSpreeVictims(victimName)
+function UnrealFX.resetKillSpreeVictims(victimName)
     UnrealFX.killSpreeVictims = {}
     UnrealFX.killSpreeFxWorldIds = {}
     if victimName ~= nil and victimName ~= L"" then
-        UnrealFX.addUnrealFX.killSpreeVictim(victimName)
+        UnrealFX.addKillSpreeVictim(victimName)
     end
 end
 
@@ -1364,7 +1364,7 @@ function UnrealFX.logDeathBlow(killType)
     TextLogAddEntry(UnrealFX.logFileName, 0, towstring(killType))
 end
 
-function UnrealFX.markUnrealFX.killSpreeFxShown(entry, worldId)
+function UnrealFX.markKillSpreeFxShown(entry, worldId)
     if type(entry) == "table" then
         entry.fxShown = true
         local id = tonumber(entry.worldId) or 0
@@ -1442,7 +1442,7 @@ function UnrealFX.announcePlayerKill(killType, victimName)
             local name = entry.name or victimName
             local worldId = tonumber(entry.worldId) or 0
             if worldId ~= 0 and (seenIds[worldId] or UnrealFX.isFxDoneWorldId(worldId)) then
-                UnrealFX.markUnrealFX.killSpreeFxShown(entry, worldId)
+                UnrealFX.markKillSpreeFxShown(entry, worldId)
             else
                 if worldId == 0 then
                     worldId = UnrealFX.resolveWorldObjForKill(name, seenIds)
@@ -1465,7 +1465,7 @@ function UnrealFX.announcePlayerKill(killType, victimName)
                     worldId = tonumber(entry.worldId) or worldId
                 end
                 if shown then
-                    UnrealFX.markUnrealFX.killSpreeFxShown(entry, worldId)
+                    UnrealFX.markKillSpreeFxShown(entry, worldId)
                     return
                 end
             end
