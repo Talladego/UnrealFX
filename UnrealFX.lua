@@ -3189,6 +3189,7 @@ function UnrealFX.TryHookDialogManager()
 end
 
 function UnrealFX.OnModulesInitialized()
+    UnrealFX.RegisterSlashCommands()
     UnrealFX.TryHookDialogManager()
     UnrealFX.TryRegisterReadyCheckPacket()
     -- Career/level data is reliably populated by now; re-evaluate in case
@@ -3916,27 +3917,19 @@ function UnrealFX.OnSlashCommand(input)
     UnrealFX.chatPrint("Unknown command or keyword. Use /ufx help or /ufx list.")
 end
 
--- Registers slash commands when LibSlash is available.
+-- Registers /ufx and /unrealfx when LibSlash is available. Safe to call again:
+-- Initialize tries first, OnModulesInitialized retries once every addon (and so
+-- LibSlash, an optional dependency) has loaded. Returns true once registered.
 function UnrealFX.RegisterSlashCommands()
-    if LibSlash and LibSlash.RegisterSlashCmd then
-        local registered = {}
-        local okShort = pcall(LibSlash.RegisterSlashCmd, "ufx", UnrealFX.OnSlashCommand)
-        if okShort then
-            registered[#registered + 1] = "/ufx"
-        end
-
-        local okLong = pcall(LibSlash.RegisterSlashCmd, "unrealfx", UnrealFX.OnSlashCommand)
-        if okLong then
-            registered[#registered + 1] = "/unrealfx"
-        end
-
-        if #registered > 0 then
-            UnrealFX.chatPrint("LibSlash detected; commands: " .. table.concat(registered, ", ") .. ".")
-        else
-            UnrealFX.chatPrint(L"LibSlash detected but slash commands could not be registered.")
-        end
-        return
+    if UnrealFX._slashRegistered then
+        return true
+    end
+    if not (LibSlash and type(LibSlash.RegisterSlashCmd) == "function") then
+        return false
     end
 
-    UnrealFX.chatPrint(L"LibSlash not found; slash commands unavailable.")
+    local okShort = pcall(LibSlash.RegisterSlashCmd, "ufx", UnrealFX.OnSlashCommand)
+    local okLong = pcall(LibSlash.RegisterSlashCmd, "unrealfx", UnrealFX.OnSlashCommand)
+    UnrealFX._slashRegistered = (okShort or okLong) and true or false
+    return UnrealFX._slashRegistered
 end
