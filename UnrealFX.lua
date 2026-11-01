@@ -674,6 +674,9 @@ end
 -- kill evidence for that id. The player's own id is never stored.
 function UnrealFX.onWorldObjReward(kind, hitTargetObjectNumber, pointsGained)
     local id = tonumber(hitTargetObjectNumber) or 0
+    if UnrealFX.probeEnabled then
+        UnrealFX.probeReward(kind, id, pointsGained)
+    end
     if id == 0 or id == UnrealFX.getPlayerWorldObjNum() then
         return false
     end
@@ -1529,7 +1532,11 @@ function UnrealFX.addKillSpreeVictim(victimName, ability)
         ability = ability,
         killT = UnrealFX.fxClock or 0,
     }
-    entry.worldId = UnrealFX.resolveWorldObjForKill(victimName, used, entry)
+    local reason
+    entry.worldId, reason = UnrealFX.resolveWorldObjForKill(victimName, used, entry)
+    if UnrealFX.probeEnabled then
+        UnrealFX.probeVictim("kill", victimName, entry.worldId, reason, entry.ability)
+    end
     list[#list + 1] = entry
     return entry.worldId
 end
@@ -2214,6 +2221,9 @@ function UnrealFX.tickFxInstance(inst, elapsed)
                 UnrealFX.sampleFxProjection(inst, win)
                 if (inst.missingTicks or 0) >= (UnrealFX.FX_MISSING_TICKS or 2) then
                     inst.fixedReason = UnrealFX.anchorFxFixed(inst, win, followId)
+                    if UnrealFX.probeEnabled then
+                        UnrealFX.probeLine("pin id " .. followId .. " -> " .. tostring(inst.fixedReason))
+                    end
                 end
             end
             if not inst.fixedAnchor then
@@ -2226,6 +2236,9 @@ function UnrealFX.tickFxInstance(inst, elapsed)
                 inst.stuckChecked = true
                 if UnrealFX.isFxWindowStuckAtOrigin(win) then
                     inst.fixedReason = UnrealFX.anchorFxFixed(inst, win, followId)
+                    if UnrealFX.probeEnabled then
+                        UnrealFX.probeLine("pin(origin) id " .. followId .. " -> " .. tostring(inst.fixedReason))
+                    end
                 end
             end
             if inst.useMoveProject and not inst.fixedAnchor then
@@ -2615,6 +2628,9 @@ end
 -- arguments; a 4th numeric abilityId is used when the client provides one.
 function UnrealFX.OnWorldObjCombatEvent(...)
     local hitTargetObjectNumber, hitAmount, textType, abilityArg = ...
+    if UnrealFX.probeEnabled then
+        UnrealFX.probeCombatEvent(select("#", ...), hitTargetObjectNumber, hitAmount, textType, abilityArg)
+    end
     -- Data only: remember the hit id, damage amount and (throttled) name. The corpse
     -- keeps this worldObjNum; the kill line later matches by name. No window work.
     local id = tonumber(hitTargetObjectNumber) or 0
@@ -2988,6 +3004,9 @@ function UnrealFX.finishPendingKillFallback(pending)
     local entry = pending.entry
     local worldId, reason = UnrealFX.resolveFxDisplayFallbackWorldId(0, pending.want, entry.killT)
     pending.reason = reason
+    if UnrealFX.probeEnabled then
+        UnrealFX.probeVictim("fallback", pending.name, worldId, reason, entry.ability)
+    end
     local shown = false
     if worldId ~= 0 then
         shown = UnrealFX.showFxOnWorldObject(pending.fxKey, worldId, {
@@ -3017,6 +3036,9 @@ function UnrealFX.tryPendingKill(pending)
         worldId, reason = UnrealFX.resolveWorldObjForKill(pending.name, used, entry)
     end
     pending.reason = reason
+    if UnrealFX.probeEnabled then
+        UnrealFX.probeVictim("retry" .. tostring(pending.tries), pending.name, worldId, reason, entry.ability)
+    end
     if worldId == 0 then
         return false
     end
@@ -3817,6 +3839,75 @@ function UnrealFX.getHelpCommandPrefix()
     return UnrealFX.makeColorLink("/ufx", UnrealFX.helpCommandColor)
 end
 
+-- Diagnostics (/ufx probe). Off by default; all output is ASCII.
+UnrealFX.probeEnabled = false
+UnrealFX.FX_PROBE_COMBAT_SECONDS = 2.0
+local probeCombatNextT = 0
+
+function UnrealFX.probeText(value)
+    if value == nil then
+        return "nil"
+    end
+    local s = UnrealFX.toNarrow(value)
+    s = string.gsub(s, "[^\32-\126]", "?")
+    return s
+end
+
+function UnrealFX.probeLine(text)
+    UnrealFX.chatPrint("[probe] " .. UnrealFX.probeText(text))
+end
+
+-- WORLD_OBJ_COMBAT_EVENT: argument count and the 4th argument, at most every 2 s.
+function UnrealFX.probeCombatEvent(argc, id, amount, textType, arg4)
+    local now = UnrealFX.fxClock or 0
+    if now < probeCombatNextT then
+        return
+    end
+    probeCombatNextT = now + (UnrealFX.FX_PROBE_COMBAT_SECONDS or 2.0)
+    local line = "combat argc=" .. tostring(argc)
+        .. " id=" .. tostring(id)
+        .. " amt=" .. tostring(amount)
+        .. " type=" .. tostring(textType)
+        .. " arg4=" .. type(arg4) .. ":" .. UnrealFX.probeText(tostring(arg4))
+    if type(arg4) == "number" and arg4 > 0 then
+        line = line .. " ability=" .. tostring(UnrealFX.getAbilityKeyById(arg4))
+    end
+    UnrealFX.probeLine(line)
+end
+
+-- XP / renown event id vs the player's id, and the name for that id.
+function UnrealFX.probeReward(kind, id, points)
+    local name = ""
+    if id ~= 0 and type(GetNameForObject) == "function" then
+        local ok, n = pcall(GetNameForObject, id)
+        if ok and n then
+            name = n
+        end
+    end
+    UnrealFX.probeLine(tostring(kind) .. " id=" .. tostring(id)
+        .. " player=" .. tostring(UnrealFX.getPlayerWorldObjNum())
+        .. " pts=" .. tostring(points)
+        .. " name=" .. UnrealFX.probeText(name))
+end
+
+function UnrealFX.probeVictim(stage, victimName, worldId, reason, ability)
+    UnrealFX.probeLine("victim " .. tostring(stage)
+        .. " name=" .. UnrealFX.probeText(victimName)
+        .. " id=" .. tostring(worldId)
+        .. " why=" .. tostring(reason)
+        .. " ability=" .. UnrealFX.probeText(ability or "?"))
+end
+
+function UnrealFX.toggleProbe()
+    UnrealFX.probeEnabled = not UnrealFX.probeEnabled
+    probeCombatNextT = 0
+    if UnrealFX.probeEnabled then
+        UnrealFX.chatPrint("Probe on: printing combat-event args, XP/renown ids and kill victim picks. /ufx probe to stop.")
+    else
+        UnrealFX.chatPrint("Probe off.")
+    end
+end
+
 function UnrealFX.chatPrint(message)
     local output = UnrealFX.getChatPrefix() .. UnrealFX.toWide(message)
     if TextLogAddEntry then
@@ -4273,6 +4364,7 @@ function UnrealFX.printSlashUsage()
     UnrealFX.chatPrint(cmd .. " fx [show|hide|list|scale <n>|<name>] -- FX overlay + matching sound on your player")
     UnrealFX.chatPrint(cmd .. " list -- list known keywords and aliases")
     UnrealFX.chatPrint(cmd .. " alerts [readycheck|scenario|fortress|lotd|defeat|pve|embrace|fetch] [on|off|toggle] -- show or change alert toggles")
+    UnrealFX.chatPrint(cmd .. " probe -- toggle kill-placement diagnostics in chat")
 end
 
 function UnrealFX.printSlashKeywords()
@@ -4383,6 +4475,11 @@ function UnrealFX.OnSlashCommand(input)
 
     if action == "status" then
         UnrealFX.printStatus()
+        return
+    end
+
+    if action == "probe" then
+        UnrealFX.toggleProbe()
         return
     end
 

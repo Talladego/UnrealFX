@@ -39,6 +39,7 @@ Output is `dist\UnrealFX.exe`; it is never committed. Release zips are built by
 | `/ufx alerts ...` | Toggle alerts (see below) |
 | `/ufx play <keyword>` | Play a WAV keyword |
 | `/ufx list` | Known keywords |
+| `/ufx probe` | Toggle kill-placement diagnostics in chat (off by default) |
 
 Also registered as `/unrealfx`.
 
