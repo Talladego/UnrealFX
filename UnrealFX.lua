@@ -272,9 +272,10 @@ UnrealFX.pullAlertConfigs = {
 }
 UnrealFX.PULL_ALERT_MIN_LEVEL = 40
 
-PlayerName = wstring.sub( GameData.Player.name,1,-3 )
-KillSpree = 0
-FirstBloodTime = 0
+-- Kill streak state (formerly the PlayerName / KillSpree / FirstBloodTime globals).
+UnrealFX.playerNameKey = L""   -- normalizeUnitName(GameData.Player.name), set in Initialize
+UnrealFX.killSpree = 0
+UnrealFX.firstBloodTime = 0
 -- Victims in the current <5s kill streak: { name=, worldId=, fxShown= } (duplicate NPC names allowed).
 UnrealFX.killSpreeVictims = UnrealFX.killSpreeVictims or {}
 -- World ids that already received kill FX in the current streak (no re-stamp).
@@ -288,7 +289,24 @@ local namedHitHead = 0        -- slot of the newest entry
 local namedHitCount = 0
 local namedHitSlotById = {}   -- world id -> slot of its live entry
 
+-- Normalized own name (no ^suffix, lowercase). Retries if the name was not yet
+-- populated when Initialize ran.
+function UnrealFX.getPlayerNameKey()
+    local key = UnrealFX.playerNameKey
+    if key == nil or key == L"" then
+        if GameData and GameData.Player then
+            key = UnrealFX.normalizeUnitName(GameData.Player.name)
+        else
+            key = L""
+        end
+        UnrealFX.playerNameKey = key
+    end
+    return key
+end
+
 function UnrealFX.Initialize()
+    UnrealFX.playerNameKey = L""
+    UnrealFX.getPlayerNameKey()
     local version = UnrealFX.VERSION or "?"
     EA_ChatWindow.Print(L"----UnrealFX v" .. towstring(version) .. L" loaded----")
 
@@ -727,17 +745,19 @@ function UnrealFX.parseOutgoingDamageCombatLog(msg, isPetHit)
     end
     local targetName, damageStr
     if isPetHit then
-        _, _, targetName, damageStr =
+        local _pet, _ability
+        _pet, _ability, targetName, damageStr =
             string.match(s, "^Your (.+)'s (.+) critically hits (.+) for (%d+) damage")
         if targetName == nil then
-            _, _, targetName, damageStr =
+            _pet, _ability, targetName, damageStr =
                 string.match(s, "^Your (.+)'s (.+) hits (.+) for (%d+) damage")
         end
     else
-        _, targetName, damageStr =
+        local _ability
+        _ability, targetName, damageStr =
             string.match(s, "^Your (.+) critically hits (.+) for (%d+) damage")
         if targetName == nil then
-            _, targetName, damageStr =
+            _ability, targetName, damageStr =
                 string.match(s, "^Your (.+) hits (.+) for (%d+) damage")
         end
     end
@@ -1116,7 +1136,7 @@ function UnrealFX.armCombatWorldObj(worldId, name)
     return true
 end
 
-function UnrealFX.addKillSpreeVictim(victimName)
+function UnrealFX.addUnrealFX.killSpreeVictim(victimName)
     if victimName == nil or victimName == L"" then
         return 0
     end
@@ -1134,11 +1154,11 @@ function UnrealFX.addKillSpreeVictim(victimName)
     return worldId
 end
 
-function UnrealFX.resetKillSpreeVictims(victimName)
+function UnrealFX.resetUnrealFX.killSpreeVictims(victimName)
     UnrealFX.killSpreeVictims = {}
     UnrealFX.killSpreeFxWorldIds = {}
     if victimName ~= nil and victimName ~= L"" then
-        UnrealFX.addKillSpreeVictim(victimName)
+        UnrealFX.addUnrealFX.killSpreeVictim(victimName)
     end
 end
 
@@ -1156,16 +1176,16 @@ function UnrealFX.processPlayerKill(victimName, currenttime)
         L"monsterkill1", L"monsterkill2", L"multikill", L"rampage", L"slaughter", L"unstoppable",
     }
 
-    if KillSpree < 1 then
-        KillSpree = KillSpree + 1
-        FirstBloodTime = currenttime
-        UnrealFX.resetKillSpreeVictims(victimName)
+    if UnrealFX.killSpree < 1 then
+        UnrealFX.killSpree = UnrealFX.killSpree + 1
+        UnrealFX.firstBloodTime = currenttime
+        UnrealFX.resetUnrealFX.killSpreeVictims(victimName)
         UnrealFX.announcePlayerKill(L"firstblood", victimName)
         return
     end
 
     local hours, mins, secs = currenttime:match(L"([0-9]+):([0-9]+):([0-9]+)")
-    local fbhours, fbmins, fbsecs = FirstBloodTime:match(L"([0-9]+):([0-9]+):([0-9]+)")
+    local fbhours, fbmins, fbsecs = UnrealFX.firstBloodTime:match(L"([0-9]+):([0-9]+):([0-9]+)")
     local fbhoursinsec = tonumber(fbhours) * 3600
     local fbminutesinsec = tonumber(fbmins) * 60
     local fbsecsnum = tonumber(fbsecs) or 0
@@ -1177,23 +1197,23 @@ function UnrealFX.processPlayerKill(victimName, currenttime)
     local diffsecs = ctotalinsec - fbtotalsec
 
     if diffsecs < 5 then
-        KillSpree = KillSpree + 1
-        UnrealFX.addKillSpreeVictim(victimName)
-        FirstBloodTime = currenttime
-        if KillSpree == 2 then
+        UnrealFX.killSpree = UnrealFX.killSpree + 1
+        UnrealFX.addUnrealFX.killSpreeVictim(victimName)
+        UnrealFX.firstBloodTime = currenttime
+        if UnrealFX.killSpree == 2 then
             -- Sound once; FX on every distinct corpse in the streak.
             UnrealFX.announcePlayerKill(L"doublekill", victimName)
             return
         end
-        if KillSpree > 2 then
+        if UnrealFX.killSpree > 2 then
             local killType = multiKillTable[math.random(#multiKillTable)]
             UnrealFX.announcePlayerKill(killType, victimName)
             return
         end
     else
-        KillSpree = 1
-        FirstBloodTime = currenttime
-        UnrealFX.resetKillSpreeVictims(victimName)
+        UnrealFX.killSpree = 1
+        UnrealFX.firstBloodTime = currenttime
+        UnrealFX.resetUnrealFX.killSpreeVictims(victimName)
         local killType = normalKillTable[math.random(#normalKillTable)]
         UnrealFX.announcePlayerKill(killType, victimName)
     end
@@ -1226,14 +1246,18 @@ function UnrealFX.OnCombatHappened(updateType, filterType)
         return
     end
 
-    if victim == PlayerName then
+    local playerKey = UnrealFX.getPlayerNameKey()
+    local victimKey = UnrealFX.normalizeUnitName(victim)
+    local killerKey = UnrealFX.normalizeUnitName(killer)
+
+    if playerKey ~= L"" and victimKey == playerKey then
         if UnrealFX.getDefeatAlertsEnabled() then
             UnrealFX.announcePlayerDeath(killer)
         end
         return
     end
 
-    if killer == PlayerName then
+    if playerKey ~= L"" and killerKey == playerKey then
         UnrealFX.processPlayerKill(victim, currenttime)
     end
 end
@@ -1276,7 +1300,7 @@ function UnrealFX.logDeathBlow(killType)
     TextLogSaveLog(UnrealFX.logFileName,towstring(""))
 end
 
-function UnrealFX.markKillSpreeFxShown(entry, worldId)
+function UnrealFX.markUnrealFX.killSpreeFxShown(entry, worldId)
     if type(entry) == "table" then
         entry.fxShown = true
         local id = tonumber(entry.worldId) or 0
@@ -1354,7 +1378,7 @@ function UnrealFX.announcePlayerKill(killType, victimName)
             local name = entry.name or victimName
             local worldId = tonumber(entry.worldId) or 0
             if worldId ~= 0 and (seenIds[worldId] or UnrealFX.isFxDoneWorldId(worldId)) then
-                UnrealFX.markKillSpreeFxShown(entry, worldId)
+                UnrealFX.markUnrealFX.killSpreeFxShown(entry, worldId)
             else
                 if worldId == 0 then
                     worldId = UnrealFX.resolveWorldObjForKill(name, seenIds)
@@ -1377,7 +1401,7 @@ function UnrealFX.announcePlayerKill(killType, victimName)
                     worldId = tonumber(entry.worldId) or worldId
                 end
                 if shown then
-                    UnrealFX.markKillSpreeFxShown(entry, worldId)
+                    UnrealFX.markUnrealFX.killSpreeFxShown(entry, worldId)
                     return
                 end
             end
