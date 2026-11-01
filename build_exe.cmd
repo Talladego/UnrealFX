@@ -3,7 +3,9 @@ setlocal EnableExtensions
 cd /d "%~dp0"
 
 rem Build a one-file UnrealFX.exe (tkinter OBS window + winsound) via PyInstaller.
-rem Requires: py -3 with pip. Output: UnrealFX.exe in this folder.
+rem Requires: py -3 with pip. Output: dist\UnrealFX.exe (never copied into the repo root;
+rem release zips are built by .github/workflows/release.yml). Keep the PyInstaller
+rem version and flags below in sync with that workflow.
 
 where py >nul 2>&1
 if errorlevel 1 (
@@ -12,7 +14,7 @@ if errorlevel 1 (
 )
 
 echo [build_exe] Ensuring PyInstaller...
-py -3 -m pip install --upgrade pyinstaller >nul
+py -3 -m pip install "pyinstaller==6.22.3" >nul
 if errorlevel 1 (
     echo [build_exe] pip install pyinstaller failed.
     exit /b 1
@@ -39,11 +41,10 @@ if not exist "dist\UnrealFX.exe" (
     exit /b 1
 )
 
-copy /y "dist\UnrealFX.exe" "UnrealFX.exe" >nul
-echo [build_exe] Wrote %CD%\UnrealFX.exe
+echo [build_exe] Wrote %CD%\dist\UnrealFX.exe
+echo [build_exe] To test it, copy it next to files\ in your installed AddOns\UnrealFX folder.
 
 rmdir /s /q build
-rmdir /s /q dist
 del /f /q UnrealFX.spec >nul 2>&1
 echo [build_exe] Done.
 exit /b 0
