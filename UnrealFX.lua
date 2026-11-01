@@ -818,7 +818,11 @@ end
 UnrealFX.FX_SENTINEL_OFFSET = -4096
 UnrealFX.FX_SENTINEL_THRESHOLD = -2000
 -- Consecutive unplaced ticks before the FX is pinned to a fixed screen spot.
+-- Off-screen does not count: Move then hides the window (see sampleFxProjection).
 UnrealFX.FX_MISSING_TICKS = 2
+-- A pinned FX checks every this many seconds (doubling after each failed check)
+-- whether its world object is back, and follows it again if so.
+UnrealFX.FX_PIN_RETRY_SECONDS = 0.5
 
 function UnrealFX.canUseFxSentinel()
     return type(WindowSetOffsetFromParent) == "function"
@@ -888,19 +892,70 @@ function UnrealFX.anchorFxFixed(inst, win, worldId)
             WindowAddAnchor(win, "center", "Root", "center", 0, 0)
         end
     end
+    -- Move may have hidden the window (off-screen) before the object went missing.
+    WindowSetShowing(win, true)
     inst.fixedAnchor = true
+    local gap = inst.pinRetryGap or UnrealFX.FX_PIN_RETRY_SECONDS or 0.5
+    inst.pinRetryAt = (inst.t or 0) + gap
+    inst.pinRetryGap = gap * 2
     return reason
 end
 
+-- Pinned FX: at most one GetNameForObject per retry interval. When the object is
+-- known again, drop the pin and follow it; the next samples decide (and re-pin at
+-- the last position if Move still cannot place it). Returns true when unpinned.
+function UnrealFX.retryPinnedFx(inst, win, worldId)
+    local t = inst.t or 0
+    if t < (inst.pinRetryAt or 0) then
+        return false
+    end
+    local gap = inst.pinRetryGap or UnrealFX.FX_PIN_RETRY_SECONDS or 0.5
+    inst.pinRetryAt = t + gap
+    inst.pinRetryGap = gap * 2
+    if type(GetNameForObject) ~= "function" then
+        return false
+    end
+    local ok, name = pcall(GetNameForObject, worldId)
+    if not ok or name == nil or name == L"" then
+        return false
+    end
+    if type(WindowClearAnchors) == "function" then
+        WindowClearAnchors(win)
+    end
+    inst.fixedAnchor = false
+    inst.fixedReason = nil
+    inst.missingTicks = 0
+    if UnrealFX.probeEnabled then
+        UnrealFX.probeLine("unpin id " .. tostring(worldId))
+    end
+    return true
+end
+
 -- One WindowGetScreenPosition per active FX per tick: remember where the client drew
--- the previous projection, or count a miss when the sentinel is still there.
+-- the previous projection. Still at the sentinel: hidden means the object is
+-- off-screen (Move hides the window and leaves it in place), so keep following;
+-- shown means Move did not place it (object missing), which counts as a miss.
 function UnrealFX.sampleFxProjection(inst, win)
     local x, y = WindowGetScreenPosition(win)
     x = tonumber(x)
     y = tonumber(y)
+    local canShow = type(WindowGetShowing) == "function"
     if UnrealFX.isSentinelPosition(x, y) then
+        if canShow and not WindowGetShowing(win) then
+            inst.offscreen = true
+            inst.missingTicks = 0
+            return false
+        end
+        inst.offscreen = false
         inst.missingTicks = (inst.missingTicks or 0) + 1
         return false
+    end
+    if inst.offscreen then
+        -- Back on screen. Show it in case the client only hides on Move.
+        inst.offscreen = false
+        if canShow and not WindowGetShowing(win) then
+            WindowSetShowing(win, true)
+        end
     end
     inst.missingTicks = 0
     inst.lastX = x
@@ -2129,6 +2184,9 @@ function UnrealFX.releaseFxInstance(inst)
     inst.lastX = nil
     inst.lastY = nil
     inst.missingTicks = nil
+    inst.offscreen = nil
+    inst.pinRetryAt = nil
+    inst.pinRetryGap = nil
     UnrealFX.fxFree = UnrealFX.fxFree or {}
     UnrealFX.fxFree[#UnrealFX.fxFree + 1] = inst
 end
@@ -2208,15 +2266,21 @@ function UnrealFX.tickFxInstance(inst, elapsed)
 
     -- Playing FX: chat-bubble projection each tick (no Attach). With Move, a sentinel
     -- offset is set before each Move and the drawn position is read once on the next
-    -- tick: a real position is remembered, a sentinel counts as a miss. After
+    -- tick: a real position is remembered; a hidden window at the sentinel is
+    -- off-screen (keep following); a shown one counts as a miss. After
     -- FX_MISSING_TICKS misses the FX is pinned (last position / event-text anchor /
-    -- screen center) instead of jumping to another target. Clients without the
-    -- sentinel APIs keep a one-time origin check.
+    -- screen center) instead of jumping to another target, and follows again once
+    -- the object is back (retryPinnedFx). Clients without the sentinel APIs keep a
+    -- one-time origin check.
     local followId = tonumber(inst.attachedId) or 0
+    local sentinel = inst.useMoveProject and UnrealFX.canUseFxSentinel()
+    if followId ~= 0 and inst.fixedAnchor and sentinel then
+        UnrealFX.retryPinnedFx(inst, win, followId)
+    end
     if followId ~= 0 and not inst.fixedAnchor then
         local ticks = inst.projectTicks or 0
         local watch = not inst.fellBackToSelf and not inst.noSelfFallback
-        if inst.useMoveProject and UnrealFX.canUseFxSentinel() then
+        if sentinel then
             if ticks >= 1 and watch then
                 UnrealFX.sampleFxProjection(inst, win)
                 if (inst.missingTicks or 0) >= (UnrealFX.FX_MISSING_TICKS or 2) then
@@ -2227,8 +2291,11 @@ function UnrealFX.tickFxInstance(inst, elapsed)
                 end
             end
             if not inst.fixedAnchor then
-                local s = UnrealFX.FX_SENTINEL_OFFSET or -4096
-                WindowSetOffsetFromParent(win, s, s)
+                -- Self / unwatched FX are never sampled, so they get no sentinel.
+                if watch then
+                    local s = UnrealFX.FX_SENTINEL_OFFSET or -4096
+                    WindowSetOffsetFromParent(win, s, s)
+                end
                 UnrealFX.projectFxToWorldObject(win, followId)
             end
         else
@@ -3244,7 +3311,8 @@ function UnrealFX.showFxOnWorldObject(requestedKey, worldId, opts)
         WindowClearAnchors(win)
     end
     WindowSetShowing(win, true)
-    if useMove and UnrealFX.canUseFxSentinel() then
+    local watched = opts.noSelfFallback ~= true and not (selfId ~= 0 and attachId == selfId)
+    if useMove and watched and UnrealFX.canUseFxSentinel() then
         local s = UnrealFX.FX_SENTINEL_OFFSET or -4096
         WindowSetOffsetFromParent(win, s, s)
     end
@@ -3286,6 +3354,9 @@ function UnrealFX.showFxOnWorldObject(requestedKey, worldId, opts)
     inst.fixedReason = nil
     inst.hasLastPos = false
     inst.missingTicks = 0
+    inst.offscreen = false
+    inst.pinRetryAt = nil
+    inst.pinRetryGap = nil
     inst.fellBackToSelf = selfId ~= 0 and attachId == selfId
     -- Block re-arm / re-FX on the intended corpse even if we displayed on self.
     UnrealFX.markFxDoneWorldId(worldId)
