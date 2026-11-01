@@ -1709,7 +1709,7 @@ function UnrealFX.processPlayerKill(victimName, source, ability)
         UnrealFX.killSpree = 1
         UnrealFX.lastKillClock = now
         UnrealFX.resetKillSpreeVictims(victimName, abilityKey)
-        UnrealFX.announcePlayerKill(L"firstblood", victimName)
+        UnrealFX.announcePlayerKill(L"firstblood", victimName, abilityKey, now)
         return
     end
 
@@ -1721,18 +1721,18 @@ function UnrealFX.processPlayerKill(victimName, source, ability)
         UnrealFX.addKillSpreeVictim(victimName, abilityKey)
         if UnrealFX.killSpree == 2 then
             -- Sound once; FX on every distinct corpse in the streak.
-            UnrealFX.announcePlayerKill(L"doublekill", victimName)
+            UnrealFX.announcePlayerKill(L"doublekill", victimName, abilityKey, now)
             return
         end
         local killType = MULTI_KILL_KEYS[math.random(#MULTI_KILL_KEYS)]
-        UnrealFX.announcePlayerKill(killType, victimName)
+        UnrealFX.announcePlayerKill(killType, victimName, abilityKey, now)
         return
     end
 
     UnrealFX.killSpree = 1
     UnrealFX.resetKillSpreeVictims(victimName, abilityKey)
     local killType = NORMAL_KILL_KEYS[math.random(#NORMAL_KILL_KEYS)]
-    UnrealFX.announcePlayerKill(killType, victimName)
+    UnrealFX.announcePlayerKill(killType, victimName, abilityKey, now)
 end
 
 function UnrealFX.OnCombatHappened(updateType, filterType)
@@ -1856,7 +1856,9 @@ function UnrealFX.markKillSpreeFxShown(entry, worldId)
     end
 end
 
-function UnrealFX.announcePlayerKill(killType, victimName)
+-- ability / killT: the kill line's normalized ability and time, for the rare path
+-- with no kill-spree row (normally the row already carries both).
+function UnrealFX.announcePlayerKill(killType, victimName, ability, killT)
     -- One announcer sound per event. FX only on corpses not yet stamped this streak.
     UnrealFX.logDeathBlow(killType)
 
@@ -1931,7 +1933,13 @@ function UnrealFX.announcePlayerKill(killType, victimName)
                     return
                 end
                 if not shown then
-                    shown = UnrealFX.playKillFx(fxKey, name, { usedIds = seenIds })
+                    -- Same spree row: its ability / killT filter the re-resolve, and a
+                    -- pending retry marks this row when it shows.
+                    local how
+                    shown, how = UnrealFX.playKillFx(fxKey, name, { usedIds = seenIds, entry = entry })
+                    if how == "pending" then
+                        return
+                    end
                     worldId = tonumber(entry.worldId) or worldId
                 end
                 if shown then
@@ -1944,7 +1952,7 @@ function UnrealFX.announcePlayerKill(killType, victimName)
         end
     end
 
-    UnrealFX.playKillFx(fxKey, victimName)
+    UnrealFX.playKillFx(fxKey, victimName, { ability = ability, killT = killT })
 end
 
 function UnrealFX.announcePlayerDeath(killerName)
@@ -3429,6 +3437,9 @@ function UnrealFX.showFxOnWorldObject(requestedKey, worldId, opts)
     return true
 end
 
+-- opts.entry: the kill-spree row ({ name, worldId, ability, killT }); without one a
+-- row is built from opts.ability / opts.killT. Returns shown[, "pending"]: "pending"
+-- means a 0.15-0.30 s retry tied to that row was queued and will mark it.
 function UnrealFX.playKillFx(killType, victimName, opts)
     -- Visual only. Sound is logged once by announcePlayerKill / logPlaybackKeyword.
     opts = opts or {}
@@ -3436,33 +3447,43 @@ function UnrealFX.playKillFx(killType, victimName, opts)
     if not fxKey then
         return false
     end
-
-    local worldId = 0
-    if opts.defeat then
-        worldId = UnrealFX.resolveWorldObjForVictim(victimName)
-    else
-        -- Combat soft-arm / dead hostile / lastHostile - never a living hostile.
-        worldId = UnrealFX.resolveWorldObjForKill(victimName, opts.usedIds)
-    end
-    if worldId ~= 0 then
-        return UnrealFX.showFxOnWorldObject(fxKey, worldId, {
-            quiet = true,
-            label = UnrealFX.toNarrow(UnrealFX.normalizeUnitName(victimName)),
-        })
-    end
+    local label = UnrealFX.toNarrow(UnrealFX.normalizeUnitName(victimName))
 
     if opts.defeat then
+        local worldId = UnrealFX.resolveWorldObjForVictim(victimName)
+        if worldId ~= 0 then
+            return UnrealFX.showFxOnWorldObject(fxKey, worldId, { quiet = true, label = label })
+        end
         UnrealFX.queuePendingFx(fxKey, victimName, { allowSelf = true })
         return true
     end
 
+    local entry = opts.entry
+    if type(entry) ~= "table" then
+        entry = {
+            name = victimName,
+            worldId = 0,
+            ability = opts.ability,
+            killT = tonumber(opts.killT) or UnrealFX.fxClock or 0,
+        }
+    end
+    -- Combat pairs / evidence / soft-arm, filtered by ability and hits after killT -
+    -- never a living hostile.
+    local worldId = UnrealFX.resolveWorldObjForKill(victimName, opts.usedIds, entry)
+    if worldId ~= 0 then
+        entry.worldId = worldId
+        local shown = UnrealFX.showFxOnWorldObject(fxKey, worldId, { quiet = true, label = label })
+        if shown then
+            UnrealFX.markKillSpreeFxShown(entry, worldId)
+        end
+        return shown
+    end
+
     -- Unknown victim world object -> short pending resolve, then fallback.
-    UnrealFX.queuePendingKillFx(fxKey, victimName, {
-        name = victimName,
-        worldId = 0,
-        killT = UnrealFX.fxClock or 0,
-    })
-    return true
+    if UnrealFX.queuePendingKillFx(fxKey, victimName, entry) then
+        return true, "pending"
+    end
+    return false
 end
 
 function UnrealFX.playSoundFx(keyword, worldId)
