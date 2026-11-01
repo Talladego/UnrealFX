@@ -105,6 +105,8 @@ UnrealFX.zeroHpRing = zeroHpRing
 -- Per-id time of WORLD_OBJ_XP_GAINED / WORLD_OBJ_RENOWN_GAINED (never the player id).
 local rewardRing = newIdTimeRing(32)
 UnrealFX.rewardRing = rewardRing
+-- Order matters: reward evidence is checked before 0% HP.
+UnrealFX._evidenceRings = { rewardRing, zeroHpRing }
 -- Recent combat-hit ids (any hit, incl. heals). times = last event; extra parallel
 -- arrays: dmgT (last damage/miss), armT (last damage = soft-arm), name/key cache and
 -- nameT (last GetNameForObject call, so at most one lookup per id per second).
@@ -143,6 +145,18 @@ function UnrealFX.getLastDamageTime(id)
         return hitRing.dmgT[slot] or nil
     end
     return nil
+end
+
+-- A corpse takes no more hits. The killing blow's own event can land a frame after
+-- the kill line, hence the small grace.
+UnrealFX.FX_KILL_HIT_GRACE = 0.1
+function UnrealFX.wasHitAfterKill(id, killT)
+    killT = tonumber(killT)
+    if not killT then
+        return false
+    end
+    local t = UnrealFX.getLastDamageTime(id)
+    return t ~= nil and t > killT + (UnrealFX.FX_KILL_HIT_GRACE or 0.1)
 end
 
 -- Damage pairing rings: fixed slots, entry tables created once per slot and reused.
@@ -188,6 +202,9 @@ end
 UnrealFX.FX_NAME_SCAN_BUDGET = 120
 UnrealFX.FX_NAME_SCAN_RADIUS = 24
 UnrealFX.FX_PENDING_SECONDS = 0.55
+-- Unresolved kill victim: retry inside OnFxUpdate at these ages, then fall back.
+UnrealFX.FX_KILL_RESOLVE_FIRST = 0.15
+UnrealFX.FX_KILL_RESOLVE_LAST = 0.30
 UnrealFX.FX_PENDING_SCAN_PER_FRAME = 48
 -- Soft-attach (hidden) on combat hits while the world object still exists - kill chat
 -- often arrives after the corpse is gone; AttachWindowToWorldObject then cannot bind.
@@ -706,7 +723,7 @@ function UnrealFX.killEvidenceBonus(id, now)
 end
 
 -- When the kill victim id is unknown / projection fails: current hostile, else self.
-function UnrealFX.resolveFxDisplayFallbackWorldId(excludeId)
+function UnrealFX.resolveFxDisplayFallbackWorldId(excludeId, wantKey)
     excludeId = tonumber(excludeId) or 0
     local hid = UnrealFX.getCurrentHostileWorldId()
     if hid ~= 0 and hid ~= excludeId then
@@ -1110,7 +1127,7 @@ end
 
 -- Among recent damage chats for victimName, pick the best amount-matched event id.
 -- Skip the living current hostile (HP > 0) - that is still targeted, not the corpse.
-function UnrealFX.findBestDamagePairWorldId(victimName, usedIds, killAbility)
+function UnrealFX.findBestDamagePairWorldId(victimName, usedIds, killAbility, killT)
     local want = UnrealFX.normalizeUnitName(victimName)
     if want == L"" then
         return 0
@@ -1138,6 +1155,10 @@ function UnrealFX.findBestDamagePairWorldId(victimName, usedIds, killAbility)
                     local id = tonumber(event.id) or 0
                     -- Living current target: keep searching for another pair.
                     if livingTargetId ~= 0 and id == livingTargetId then
+                        id = 0
+                    end
+                    -- Hit again after the kill: still alive, not the victim.
+                    if id ~= 0 and UnrealFX.wasHitAfterKill(id, killT) then
                         id = 0
                     end
                     if id ~= 0
@@ -1203,18 +1224,24 @@ end
 
 -- Kill FX world id. Prefer best damage-event/combat-chat amount+name pair, then
 -- soft-arm / SCT / dead hostile. Self fallback is handled by playKillFx / announce.
--- opts (optional): { ability = normalized kill-line ability }.
+-- opts (optional): { ability = normalized kill-line ability, killT = fxClock of the
+-- kill line }. With killT, ids damaged again after the kill are skipped.
+-- Returns id, reason (short ASCII tag for the probe).
 function UnrealFX.resolveWorldObjForKill(victimName, usedIds, opts)
     local want = UnrealFX.normalizeUnitName(victimName)
     if want == L"" then
-        return 0
+        return 0, "noname"
     end
     usedIds = usedIds or {}
     local killAbility = opts and opts.ability or nil
+    local killT = opts and opts.killT or nil
     local avoidId = UnrealFX.getLivingHostileWorldId()
     local combatIds = UnrealFX.collectCombatHitWorldObjsNewestFirst()
 
     local function usable(id, allowAvoid)
+        if killT and UnrealFX.wasHitAfterKill(id, killT) then
+            return false
+        end
         if allowAvoid then
             return UnrealFX.isUsableVictimWorldId(id, usedIds, 0)
         end
@@ -1223,7 +1250,7 @@ function UnrealFX.resolveWorldObjForKill(victimName, usedIds, opts)
 
     local probesLeft = UnrealFX.FX_KILL_PROBE_CAP or 48
     local function softArmMatches(slot, id)
-        local key = hitRing.key[slot]
+        local key = slot and hitRing.key[slot]
         if key then
             return key == want
         end
@@ -1235,15 +1262,41 @@ function UnrealFX.resolveWorldObjForKill(victimName, usedIds, opts)
     end
 
     -- 0) Best YOUR_HITS chat + WORLD_OBJ_COMBAT_EVENT amount pair for this victim.
-    local pairId = UnrealFX.findBestDamagePairWorldId(want, usedIds, killAbility)
+    local pairId = UnrealFX.findBestDamagePairWorldId(want, usedIds, killAbility, killT)
     if pairId ~= 0 then
-        return pairId
+        return pairId, "pair"
+    end
+
+    local now = UnrealFX.fxClock or 0
+
+    -- 0b) Kill evidence: ids that just gave XP/renown or showed 0% HP, newest first,
+    -- when their name matches (cached hit name, else a capped probe).
+    do
+        local win = UnrealFX.FX_KILL_EVIDENCE_SECONDS or 3.0
+        local rings = UnrealFX._evidenceRings
+        for r = 1, #rings do
+            local ring = rings[r]
+            for k = 1, ring.count do
+                local id, t = idRingAt(ring, k)
+                if id and t and (now - t) <= win and usable(id, true) then
+                    local slot = hitRing.slotById[id]
+                    local matches
+                    if slot and hitRing.key[slot] then
+                        matches = hitRing.key[slot] == want
+                    else
+                        matches = softArmMatches(slot, id)
+                    end
+                    if matches then
+                        return id, (r == 1) and "reward" or "zerohp"
+                    end
+                end
+            end
+        end
     end
 
     -- 1) Soft-armed ids (damaged within FX_ARM_SECONDS): prefer ids that are not the
     -- living hostile (AOE same-name), then allow the living hostile itself when it was
     -- soft-armed (targeted kill + HP lag).
-    local now = UnrealFX.fxClock or 0
     local armDur = UnrealFX.FX_ARM_SECONDS or 8.0
     local softAvoidMatch = 0
     for k = 1, hitRing.count do
@@ -1253,7 +1306,7 @@ function UnrealFX.resolveWorldObjForKill(victimName, usedIds, opts)
         if armT and now - armT <= armDur and not UnrealFX.isFxDoneWorldId(id) then
             if softArmMatches(slot, id) then
                 if usable(id, false) then
-                    return id
+                    return id, "softarm"
                 end
                 if softAvoidMatch == 0 and avoidId ~= 0 and id == avoidId and usable(id, true) then
                     softAvoidMatch = id
@@ -1262,7 +1315,7 @@ function UnrealFX.resolveWorldObjForKill(victimName, usedIds, opts)
         end
     end
     if softAvoidMatch ~= 0 then
-        return softAvoidMatch
+        return softAvoidMatch, "softarm-target"
     end
 
     -- 2) Named combat hits learned while alive (unconsumed), newest first.
@@ -1272,7 +1325,7 @@ function UnrealFX.resolveWorldObjForKill(victimName, usedIds, opts)
         if hit and hit.id ~= 0 and hit.fromCombat and not hit.consumed and hit.key == want then
             local id = hit.id
             if usable(id, false) then
-                return id
+                return id, "named"
             end
             if namedAvoidMatch == 0 and avoidId ~= 0 and id == avoidId and usable(id, true) then
                 namedAvoidMatch = id
@@ -1280,7 +1333,7 @@ function UnrealFX.resolveWorldObjForKill(victimName, usedIds, opts)
         end
     end
     if namedAvoidMatch ~= 0 then
-        return namedAvoidMatch
+        return namedAvoidMatch, "named-target"
     end
 
     -- 3) Probe recent combat + CustomUI SCT EventTracker ids by name (same source
@@ -1295,7 +1348,7 @@ function UnrealFX.resolveWorldObjForKill(victimName, usedIds, opts)
             probesLeft = probesLeft - 1
             if UnrealFX.probeWorldObjName(id, want) ~= 0 then
                 if usable(id, false) then
-                    return id
+                    return id, "probe"
                 end
                 if probeAvoidMatch == 0 and avoidId ~= 0 and id == avoidId and usable(id, true) then
                     probeAvoidMatch = id
@@ -1304,7 +1357,7 @@ function UnrealFX.resolveWorldObjForKill(victimName, usedIds, opts)
         end
     end
     if probeAvoidMatch ~= 0 then
-        return probeAvoidMatch
+        return probeAvoidMatch, "probe-target"
     end
 
     -- 4) Dead / cleared hostile matching the kill name (targeted kill), from the snapshot.
@@ -1318,22 +1371,22 @@ function UnrealFX.resolveWorldObjForKill(victimName, usedIds, opts)
             -- only accept when combat evidence already pointed at this same id (steps 1-3
             -- would have returned it via allowAvoid - reaching here means no soft-arm/hit,
             -- so require hp <= 0 or lastHostile agreement below).
-            if hp ~= nil and hp <= 0 and UnrealFX.isUsableVictimWorldId(tid, usedIds, 0) then
-                return tid
+            if hp ~= nil and hp <= 0 and usable(tid, true) then
+                return tid, "deadtarget"
             end
         elseif tid == 0 or tname == nil or tname == L"" then
             local last = UnrealFX.lastHostile
             if type(last) == "table" and UnrealFX.namesEqual(last.name, want) then
                 local lid = tonumber(last.id) or 0
-                if UnrealFX.isUsableVictimWorldId(lid, usedIds, 0) then
+                if usable(lid, true) then
                     -- Cleared target: corpse id from lastHostile (HP lag / slot wipe).
-                    return lid
+                    return lid, "lasttarget"
                 end
             end
         end
     end
 
-    return 0
+    return 0, "none"
 end
 
 -- Soft-arm: data only. Stamps the hit-ring slot; no window work per hit. The corpse
@@ -1366,6 +1419,7 @@ function UnrealFX.addKillSpreeVictim(victimName, ability)
         name = victimName,
         worldId = 0,
         ability = ability,
+        killT = UnrealFX.fxClock or 0,
     }
     entry.worldId = UnrealFX.resolveWorldObjForKill(victimName, used, entry)
     list[#list + 1] = entry
@@ -1658,10 +1712,10 @@ function UnrealFX.announcePlayerKill(killType, victimName)
                         label = UnrealFX.toNarrow(UnrealFX.normalizeUnitName(name)),
                     })
                 else
-                    -- Unknown victim after damage-pair / resolve -> self.
-                    shown = UnrealFX.showFxOnSelf(fxKey, { quiet = true })
-                    worldId = UnrealFX.getSelfWorldObjNum()
-                    entry.worldId = worldId
+                    -- Unknown victim: retry for 0.15-0.30 s in OnFxUpdate (corpse
+                    -- evidence, no hits after the kill) before any fallback.
+                    UnrealFX.queuePendingKillFx(fxKey, name, entry)
+                    return
                 end
                 if not shown then
                     shown = UnrealFX.playKillFx(fxKey, name, { usedIds = seenIds })
@@ -2781,6 +2835,104 @@ function UnrealFX.queuePendingFx(fxKey, unitName, opts)
 end
 
 local PENDING_RESOLVE_OPTS = { skipScan = true, skipCapture = true }
+local EMPTY_IDS = {}
+
+-- Pending kill FX: entry is the kill-spree row ({ name, worldId, ability, killT }).
+-- Not deduped by name: two same-named mobs can die together.
+function UnrealFX.queuePendingKillFx(fxKey, victimName, entry)
+    local want = UnrealFX.normalizeUnitName(victimName)
+    if not fxKey or want == L"" or type(entry) ~= "table" then
+        return false
+    end
+    UnrealFX.pendingFxQueue = UnrealFX.pendingFxQueue or {}
+    local queue = UnrealFX.pendingFxQueue
+    local maxN = UnrealFX.FX_MAX_INSTANCES or 8
+    while #queue >= maxN do
+        table.remove(queue, 1)
+    end
+    if entry.killT == nil then
+        entry.killT = UnrealFX.fxClock or 0
+    end
+    queue[#queue + 1] = {
+        kind = "kill",
+        fxKey = fxKey,
+        want = want,
+        name = victimName,
+        label = UnrealFX.toNarrow(want),
+        t = 0,
+        tries = 0,
+        entry = entry,
+    }
+    return true
+end
+
+-- Unresolved after the last try: never a living, different hostile.
+function UnrealFX.finishPendingKillFallback(pending)
+    local entry = pending.entry
+    local worldId = UnrealFX.resolveFxDisplayFallbackWorldId(0, pending.want)
+    local shown = false
+    if worldId ~= 0 then
+        shown = UnrealFX.showFxOnWorldObject(pending.fxKey, worldId, {
+            quiet = true,
+            label = pending.label,
+        })
+    end
+    if shown then
+        UnrealFX.markKillSpreeFxShown(entry, worldId)
+    end
+    return worldId, shown
+end
+
+-- One kill retry. Returns true when the pending entry is finished.
+function UnrealFX.tryPendingKill(pending)
+    local entry = pending.entry
+    if entry.fxShown then
+        return true
+    end
+    local used = UnrealFX.killSpreeFxWorldIds or EMPTY_IDS
+    local worldId = tonumber(entry.worldId) or 0
+    local reason = "spree"
+    if worldId ~= 0 and (used[worldId] or UnrealFX.wasHitAfterKill(worldId, entry.killT)) then
+        worldId = 0
+    end
+    if worldId == 0 then
+        worldId, reason = UnrealFX.resolveWorldObjForKill(pending.name, used, entry)
+    end
+    pending.reason = reason
+    if worldId == 0 then
+        return false
+    end
+    entry.worldId = worldId
+    local shown = UnrealFX.showFxOnWorldObject(pending.fxKey, worldId, {
+        quiet = true,
+        label = pending.label,
+    })
+    if shown then
+        UnrealFX.markKillSpreeFxShown(entry, worldId)
+    end
+    return true
+end
+
+-- Returns true when the pending kill is finished (shown or fallen back).
+function UnrealFX.tickPendingKill(pending)
+    local t = pending.t
+    if pending.tries == 0 and t >= (UnrealFX.FX_KILL_RESOLVE_FIRST or 0.15) then
+        pending.tries = 1
+        if UnrealFX.tryPendingKill(pending) then
+            return true
+        end
+    end
+    if pending.tries == 1 and t >= (UnrealFX.FX_KILL_RESOLVE_LAST or 0.30) then
+        pending.tries = 2
+        if UnrealFX.tryPendingKill(pending) then
+            return true
+        end
+        pending.reason = "fallback"
+        UnrealFX.finishPendingKillFallback(pending)
+        return true
+    end
+    return false
+end
 
 function UnrealFX.tickPendingFx(elapsed)
     local queue = UnrealFX.pendingFxQueue
@@ -2794,6 +2946,13 @@ function UnrealFX.tickPendingFx(elapsed)
         local pending = queue[i]
         pending.t = (pending.t or 0) + dt
 
+        if pending.kind == "kill" then
+            if UnrealFX.tickPendingKill(pending) then
+                table.remove(queue, i)
+            else
+                i = i + 1
+            end
+        else
         local worldId = UnrealFX.resolveWorldObjForVictim(pending.want, PENDING_RESOLVE_OPTS)
         if worldId == 0 and type(GetNameForObject) == "function" then
             local perFrame = UnrealFX.FX_PENDING_SCAN_PER_FRAME or 48
@@ -2829,6 +2988,7 @@ function UnrealFX.tickPendingFx(elapsed)
             end
         else
             i = i + 1
+        end
         end
     end
 end
@@ -3029,11 +3189,13 @@ function UnrealFX.playKillFx(killType, victimName, opts)
         return true
     end
 
-    -- Unknown victim world object -> self.
-    return UnrealFX.showFxOnSelf(fxKey, {
-        quiet = true,
-        label = UnrealFX.toNarrow(UnrealFX.normalizeUnitName(victimName)),
+    -- Unknown victim world object -> short pending resolve, then fallback.
+    UnrealFX.queuePendingKillFx(fxKey, victimName, {
+        name = victimName,
+        worldId = 0,
+        killT = UnrealFX.fxClock or 0,
     })
+    return true
 end
 
 function UnrealFX.playSoundFx(keyword, worldId)
