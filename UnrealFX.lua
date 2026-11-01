@@ -1,7 +1,6 @@
 UnrealFX = UnrealFX or {}
 UnrealFX.settings = UnrealFX.settings or {}
 UnrealFX.logFileName = "UnrealFX"
-UnrealFX.VERSION = "2.0.0"
 UnrealFX.prefixName = "UnrealFX"
 UnrealFX.prefixColor = { 255, 0, 0 }
 UnrealFX.helpHeaderColor = { 255, 220, 120 }
@@ -10,7 +9,6 @@ UnrealFX.helpCommandColor = { 160, 220, 255 }
 -- World-attached announcer FX (TGA overlays). SCT-style: one window per victim so
 -- multi-kills can show on every killed target at once, not only the current target.
 UnrealFX.FX_WINDOW_PREFIX = "UnrealFXWindow"
-UnrealFX.FX_WINDOW = "UnrealFXWindow" -- legacy single-name (retired; pool uses PREFIX..id)
 UnrealFX.FX_TEMPLATE = "UnrealFXTemplate"
 -- Texture pixel size must match files/*.tga (456x256 RLE).
 UnrealFX.FX_TEX_W = 456
@@ -28,8 +26,6 @@ UnrealFX.FX_SPIN_GROW_SECONDS = UnrealFX.FX_GROW_SECONDS
 UnrealFX.FX_SHAKE_SECONDS = 0.65
 UnrealFX.FX_HOLD_SECONDS = 0.25
 UnrealFX.FX_FADE_SECONDS = 1.0
--- Legacy alias used by older call sites / comments.
-UnrealFX.FX_ANIM_SECONDS = UnrealFX.FX_GROW_SECONDS
 UnrealFX.FX_SHAKE_AMP = 20
 UnrealFX.FX_SHAKE_FREQ = 32
 UnrealFX.FX_SHAKE_VERT = 0.55
@@ -56,18 +52,202 @@ UnrealFX.fxLastKey = nil
 UnrealFX.worldObjByName = UnrealFX.worldObjByName or {}
 -- Sticky hostile: target often clears on death before the kill chat line arrives.
 UnrealFX.lastHostile = UnrealFX.lastHostile or { id = 0, name = L"" }
--- Recent hit-target entity ids (WORLD_OBJ_COMBAT_EVENT). Used as scan seeds.
-UnrealFX.recentWorldObjIds = UnrealFX.recentWorldObjIds or {}
-UnrealFX.recentWorldObjIdSet = UnrealFX.recentWorldObjIdSet or {}
+-- Target snapshots. Only OnPlayerTargetUpdated refreshes TargetInfo (UpdateFromClient);
+-- everything else reads these reused tables. hp = -1 when unknown.
+UnrealFX.targetSnap = UnrealFX.targetSnap or {
+    hostile = { id = 0, key = L"", name = L"", hp = -1, t = 0 },
+    mouseover = { id = 0, key = L"", name = L"", hp = -1, t = 0 },
+}
+-- Recent hit-target entity ids (WORLD_OBJ_COMBAT_EVENT): fixed ring, see hitRing below.
 UnrealFX.FX_RECENT_WORLD_OBJ_MAX = 96
+
+-- Fixed-size id -> time rings: parallel arrays, no per-entry tables. Setting a known
+-- id moves it to the newest slot (LRU), so an id still being hit is never evicted
+-- by newer ones; a new id overwrites the oldest slot. ring.cols lists extra
+-- parallel arrays that move with the id (ring.tmp is their reused swap row).
+local function newIdTimeRing(cap)
+    return { cap = cap, head = 0, count = 0, ids = {}, times = {}, slotById = {}, cols = nil, tmp = nil }
+end
+-- Move the entry at slot to the head, shifting the newer entries back one slot.
+-- Cost is the number of newer entries (usually a few); no allocation.
+local function idRingMoveToHead(ring, slot)
+    local head = ring.head
+    if slot == head then
+        return slot
+    end
+    local cap, ids, times, slotById = ring.cap, ring.ids, ring.times, ring.slotById
+    local cols, tmp = ring.cols, ring.tmp
+    local nc = cols and #cols or 0
+    local id, t = ids[slot], times[slot]
+    for c = 1, nc do
+        tmp[c] = cols[c][slot]
+    end
+    local k = slot
+    while k ~= head do
+        local nx = (k % cap) + 1
+        local movedId = ids[nx]
+        ids[k] = movedId
+        times[k] = times[nx]
+        slotById[movedId] = k
+        for c = 1, nc do
+            local col = cols[c]
+            col[k] = col[nx]
+        end
+        k = nx
+    end
+    ids[head] = id
+    times[head] = t
+    slotById[id] = head
+    for c = 1, nc do
+        cols[c][head] = tmp[c]
+    end
+    return head
+end
+local function idRingSet(ring, id, t)
+    local slot = ring.slotById[id]
+    if slot then
+        ring.times[slot] = t
+        return idRingMoveToHead(ring, slot)
+    end
+    local head = (ring.head % ring.cap) + 1
+    ring.head = head
+    local old = ring.ids[head]
+    if old and ring.slotById[old] == head then
+        ring.slotById[old] = nil
+    end
+    ring.ids[head] = id
+    ring.times[head] = t
+    ring.slotById[id] = head
+    if ring.count < ring.cap then
+        ring.count = ring.count + 1
+    end
+    return head
+end
+local function idRingGet(ring, id)
+    local slot = ring.slotById[id]
+    if slot then
+        return ring.times[slot]
+    end
+    return nil
+end
+-- k = 1 is the most recently set id. Returns id, time.
+local function idRingAt(ring, k)
+    local slot = ((ring.head - k) % ring.cap) + 1
+    return ring.ids[slot], ring.times[slot]
+end
+UnrealFX._idRing = { new = newIdTimeRing, set = idRingSet, get = idRingGet, at = idRingAt, toHead = idRingMoveToHead }
+-- Per-id time a target slot reported 0% HP (from PLAYER_TARGET_UPDATED snapshots).
+local zeroHpRing = newIdTimeRing(32)
+UnrealFX.zeroHpRing = zeroHpRing
+-- Per-id time of WORLD_OBJ_XP_GAINED / WORLD_OBJ_RENOWN_GAINED (never the player id).
+local rewardRing = newIdTimeRing(32)
+UnrealFX.rewardRing = rewardRing
+-- Order matters: reward evidence is checked before 0% HP.
+UnrealFX._evidenceRings = { rewardRing, zeroHpRing }
+-- Recent combat-hit ids (damage and misses; heals are not recorded). times = last
+-- event; extra parallel arrays: dmgT (last damage/miss), armT (last damage =
+-- soft-arm), name/key cache and nameT (last GetNameForObject call, so at most one
+-- lookup per id per second).
+local hitRing = newIdTimeRing(UnrealFX.FX_RECENT_WORLD_OBJ_MAX)
+hitRing.dmgT = {}
+hitRing.armT = {}
+hitRing.name = {}
+hitRing.key = {}
+hitRing.nameT = {}
+hitRing.cols = { hitRing.dmgT, hitRing.armT, hitRing.name, hitRing.key, hitRing.nameT }
+hitRing.tmp = {}
+UnrealFX.hitRing = hitRing
+UnrealFX.FX_NAME_LOOKUP_SECONDS = 1.0
+-- Kill-time scan caps (GetNameForObject probes per resolve).
+UnrealFX.FX_KILL_PROBE_CAP = 48
+
+-- Remember a combat-hit id; returns its ring slot. No allocation once the ring is full.
+local function touchCombatHit(id, now)
+    local isNew = hitRing.slotById[id] == nil
+    local slot = idRingSet(hitRing, id, now)
+    if isNew then
+        hitRing.dmgT[slot] = false
+        hitRing.armT[slot] = false
+        hitRing.name[slot] = false
+        hitRing.key[slot] = false
+        hitRing.nameT[slot] = false
+    end
+    if id > (UnrealFX.nameScanMaxSeen or 0) then
+        UnrealFX.nameScanMaxSeen = id
+    end
+    return slot
+end
+
+-- Last damage/miss time on id (nil if unknown). Used to drop ids hit after a kill.
+function UnrealFX.getLastDamageTime(id)
+    local slot = hitRing.slotById[tonumber(id) or 0]
+    if slot then
+        return hitRing.dmgT[slot] or nil
+    end
+    return nil
+end
+
+-- A corpse takes no more hits. The killing blow's own event can land a frame after
+-- the kill line, hence the small grace.
+UnrealFX.FX_KILL_HIT_GRACE = 0.1
+function UnrealFX.wasHitAfterKill(id, killT)
+    killT = tonumber(killT)
+    if not killT then
+        return false
+    end
+    local t = UnrealFX.getLastDamageTime(id)
+    return t ~= nil and t > killT + (UnrealFX.FX_KILL_HIT_GRACE or 0.1)
+end
+
+-- Damage pairing rings: fixed slots, entry tables created once per slot and reused.
+local function newEntryRing(cap)
+    return { cap = cap, head = 0, count = 0, items = {} }
+end
+local function entryRingNext(ring)
+    local head = (ring.head % ring.cap) + 1
+    ring.head = head
+    local entry = ring.items[head]
+    if entry == nil then
+        entry = {}
+        ring.items[head] = entry
+    end
+    if ring.count < ring.cap then
+        ring.count = ring.count + 1
+    end
+    return entry
+end
+-- k = 1 is the newest entry.
+local function entryRingAt(ring, k)
+    if k < 1 or k > ring.count then
+        return nil
+    end
+    return ring.items[((ring.head - k) % ring.cap) + 1]
+end
+UnrealFX._entryRing = { new = newEntryRing, next = entryRingNext, at = entryRingAt }
+
+-- Target slot lists, built once on first use (TargetInfo may load after this file).
+local victimNameSlots = nil
+local function getVictimNameSlots()
+    if victimNameSlots == nil then
+        victimNameSlots = {
+            (TargetInfo and TargetInfo.HOSTILE_TARGET) or "selfhostiletarget",
+            "mouseovertarget",
+            (TargetInfo and TargetInfo.FRIENDLY_TARGET) or "selffriendlytarget",
+        }
+    end
+    return victimNameSlots
+end
 -- No client API maps player name -> entity id. GetNameForObject can reverse-lookup
 -- ids within ~180 yards; we budget-scan known seeds + a local id window.
 UnrealFX.FX_NAME_SCAN_BUDGET = 120
 UnrealFX.FX_NAME_SCAN_RADIUS = 24
 UnrealFX.FX_PENDING_SECONDS = 0.55
+-- Unresolved kill victim: retry inside OnFxUpdate at these ages, then fall back.
+UnrealFX.FX_KILL_RESOLVE_FIRST = 0.15
+UnrealFX.FX_KILL_RESOLVE_LAST = 0.30
 UnrealFX.FX_PENDING_SCAN_PER_FRAME = 48
--- Soft-attach (hidden) on combat hits while the world object still exists - kill chat
--- often arrives after the corpse is gone; AttachWindowToWorldObject then cannot bind.
+-- Soft-arm window: an id damaged by you within this many seconds is a kill candidate
+-- (hit ring timestamp only; nothing is attached on hit).
 UnrealFX.FX_ARM_SECONDS = 8.0
 -- After a kill FX plays on a world id, ignore that id for re-arm / re-FX briefly.
 UnrealFX.FX_DONE_SECONDS = 8.0
@@ -76,8 +256,15 @@ UnrealFX.FX_DONE_SECONDS = 8.0
 UnrealFX.FX_DAMAGE_PAIR_SECONDS = 3.0
 UnrealFX.FX_DAMAGE_PAIR_MAX = 24
 UnrealFX.FX_DAMAGE_PAIR_CHAT_CANDIDATES = 8
-UnrealFX.recentDamageEvents = UnrealFX.recentDamageEvents or {} -- { id, amount, t, used }
-UnrealFX.recentDamageChats = UnrealFX.recentDamageChats or {} -- { key, amount, t, used }
+-- Kill-line ability vs the paired hit's ability (combat log or event abilityId).
+UnrealFX.FX_ABILITY_MATCH_BONUS = 3000
+UnrealFX.FX_ABILITY_MISMATCH_PENALTY = 1500
+-- Combat-log ability vs event abilityId ability on the same pair.
+UnrealFX.FX_PAIR_ABILITY_AGREE_BONUS = 500
+UnrealFX.FX_PAIR_ABILITY_DISAGREE_PENALTY = 800
+-- Fixed rings of reused { id, amount, t, used } / { key, amount, t, used } entries.
+UnrealFX.recentDamageEvents = newEntryRing(UnrealFX.FX_DAMAGE_PAIR_MAX)
+UnrealFX.recentDamageChats = newEntryRing(UnrealFX.FX_DAMAGE_PAIR_MAX)
 UnrealFX.fxClock = UnrealFX.fxClock or 0
 UnrealFX.fxDoneWorldIds = UnrealFX.fxDoneWorldIds or {}
 UnrealFX.pendingFxQueue = UnrealFX.pendingFxQueue or {}
@@ -249,20 +436,41 @@ UnrealFX.pullAlertConfigs = {
 }
 UnrealFX.PULL_ALERT_MIN_LEVEL = 40
 
-PlayerName = wstring.sub( GameData.Player.name,1,-3 )
-KillSpree = 0
-FirstBloodTime = 0
+-- Kill streak state (formerly the PlayerName / KillSpree / FirstBloodTime globals).
+UnrealFX.playerNameKey = L""   -- normalizeUnitName(GameData.Player.name), set in Initialize
+UnrealFX.killSpree = 0
+UnrealFX.lastKillClock = 0     -- UnrealFX.fxClock of the previous kill (monotonic)
 -- Victims in the current <5s kill streak: { name=, worldId=, fxShown= } (duplicate NPC names allowed).
 UnrealFX.killSpreeVictims = UnrealFX.killSpreeVictims or {}
 -- World ids that already received kill FX in the current streak (no re-stamp).
 UnrealFX.killSpreeFxWorldIds = UnrealFX.killSpreeFxWorldIds or {}
--- Newest-last combat hits with names - needed when many identical PVE mobs die.
-UnrealFX.recentNamedHits = UnrealFX.recentNamedHits or {}
+-- Recent combat hits with names - needed when many identical PVE mobs die.
+-- Fixed-size ring buffer: entry tables are reused, one live entry per world id.
+-- Read newest-first with UnrealFX.getRecentNamedHit(k) for k = 1..getRecentNamedHitCount().
+local NAMED_HIT_CAP = 96
+local namedHitRing = {}       -- slot (1..NAMED_HIT_CAP) -> entry table
+local namedHitHead = 0        -- slot of the newest entry
+local namedHitCount = 0
+local namedHitSlotById = {}   -- world id -> slot of its live entry
+
+-- Normalized own name (no ^suffix, lowercase). Retries if the name was not yet
+-- populated when Initialize ran.
+function UnrealFX.getPlayerNameKey()
+    local key = UnrealFX.playerNameKey
+    if key == nil or key == L"" then
+        if GameData and GameData.Player then
+            key = UnrealFX.normalizeUnitName(GameData.Player.name)
+        else
+            key = L""
+        end
+        UnrealFX.playerNameKey = key
+    end
+    return key
+end
 
 function UnrealFX.Initialize()
-    local version = UnrealFX.VERSION or "?"
-    EA_ChatWindow.Print(L"----UnrealFX v" .. towstring(version) .. L" loaded----")
-
+    UnrealFX.playerNameKey = L""
+    UnrealFX.getPlayerNameKey()
     TextLogCreate(UnrealFX.logFileName, 18000)
     TextLogSetEnabled(UnrealFX.logFileName, true)
     TextLogSetIncrementalSaving(UnrealFX.logFileName, true, StringToWString("logs/"..UnrealFX.logFileName..".log"))
@@ -294,6 +502,12 @@ function UnrealFX.Initialize()
         if SystemData.Events.WORLD_OBJ_COMBAT_EVENT then
             RegisterEventHandler(SystemData.Events.WORLD_OBJ_COMBAT_EVENT, "UnrealFX.OnWorldObjCombatEvent")
         end
+        if SystemData.Events.WORLD_OBJ_XP_GAINED then
+            RegisterEventHandler(SystemData.Events.WORLD_OBJ_XP_GAINED, "UnrealFX.OnWorldObjXpGained")
+        end
+        if SystemData.Events.WORLD_OBJ_RENOWN_GAINED then
+            RegisterEventHandler(SystemData.Events.WORLD_OBJ_RENOWN_GAINED, "UnrealFX.OnWorldObjRenownGained")
+        end
         if SystemData.Events.PLAYER_TARGET_UPDATED then
             RegisterEventHandler(SystemData.Events.PLAYER_TARGET_UPDATED, "UnrealFX.OnPlayerTargetUpdated")
         end
@@ -301,10 +515,50 @@ function UnrealFX.Initialize()
 
     UnrealFX.TryHookDialogManager()
     UnrealFX.TryRegisterReadyCheckPacket()
-    UnrealFX.RegisterSlashCommands()
+    if UnrealFX.RegisterSlashCommands() then
+        UnrealFX.printLoginLine()
+    end
     UnrealFX.updatePullAlertWatch()
-    UnrealFX.captureHostileTarget()
-    UnrealFX.printAlertSettings()
+    -- Seed snapshots from TargetInfo's cached slots (no client refresh here).
+    UnrealFX.snapshotTargets(false)
+end
+
+-- One chat line per login. Printed from Initialize when /ufx is ready, otherwise
+-- after ALL_MODULES_INITIALIZED once the LibSlash retry has run.
+-- The version lives only in UnrealFX.mod (<UiMod version="...">); read it from
+-- the client's module list so there is a single place to bump.
+function UnrealFX.getVersion()
+    if UnrealFX._version then
+        return UnrealFX._version
+    end
+    local version = "?"
+    if type(ModulesGetData) == "function" then
+        local ok, mods = pcall(ModulesGetData)
+        if ok and type(mods) == "table" then
+            for _, mod in ipairs(mods) do
+                if type(mod) == "table" and mod.name == "UnrealFX" and mod.version ~= nil then
+                    version = tostring(mod.version)
+                    break
+                end
+            end
+        end
+    end
+    if version ~= "?" then
+        UnrealFX._version = version
+    end
+    return version
+end
+
+function UnrealFX.printLoginLine()
+    if UnrealFX._loginLinePrinted then
+        return
+    end
+    UnrealFX._loginLinePrinted = true
+    local hint = " Type /ufx for commands."
+    if not UnrealFX._slashRegistered then
+        hint = " Install LibSlash for /ufx commands."
+    end
+    UnrealFX.chatPrint("v" .. UnrealFX.getVersion() .. " loaded." .. hint)
 end
 
 function UnrealFX.collectUsedSpreeWorldIds()
@@ -359,37 +613,52 @@ function UnrealFX.shouldSkipPveVictim(victimName)
         return true
     end
 
-    local hits = UnrealFX.recentNamedHits
-    if type(hits) == "table" then
-        for i = #hits, 1, -1 do
-            local hit = hits[i]
-            if hit and hit.key == want and UnrealFX.isLikelyPlayerPetMeta(hit) then
-                return true
-            end
+    for k = 1, namedHitCount do
+        local hit = UnrealFX.getRecentNamedHit(k)
+        if hit and hit.id ~= 0 and hit.key == want and UnrealFX.isLikelyPlayerPetMeta(hit) then
+            return true
         end
     end
     return false
 end
 
-function UnrealFX.rememberRecentNamedHit(worldObjNum, name, meta)
+function UnrealFX.rememberRecentNamedHit(worldObjNum, name, meta, key)
     local id = tonumber(worldObjNum) or 0
-    local key = UnrealFX.normalizeUnitName(name)
+    key = key or UnrealFX.normalizeUnitName(name)
     if id == 0 or key == L"" then
         return
     end
-    local list = UnrealFX.recentNamedHits
-    if type(list) ~= "table" then
-        list = {}
-        UnrealFX.recentNamedHits = list
-    end
     -- Keep a single newest entry per world id so target polling cannot bury combat hits.
-    for i = #list, 1, -1 do
-        if list[i] and (tonumber(list[i].id) or 0) == id then
-            table.remove(list, i)
-            break
+    local oldSlot = namedHitSlotById[id]
+    if oldSlot then
+        local old = namedHitRing[oldSlot]
+        if old then
+            old.id = 0
         end
+        namedHitSlotById[id] = nil
     end
-    local entry = { id = id, key = key, fromCombat = false }
+
+    namedHitHead = (namedHitHead % NAMED_HIT_CAP) + 1
+    local entry = namedHitRing[namedHitHead]
+    if entry == nil then
+        entry = {}
+        namedHitRing[namedHitHead] = entry
+    elseif entry.id ~= 0 and namedHitSlotById[entry.id] == namedHitHead then
+        namedHitSlotById[entry.id] = nil
+    end
+    if namedHitCount < NAMED_HIT_CAP then
+        namedHitCount = namedHitCount + 1
+    end
+
+    entry.id = id
+    entry.key = key
+    entry.t = UnrealFX.fxClock or 0
+    entry.consumed = false
+    entry.fromCombat = false
+    entry.isPvP = nil
+    entry.isNPC = nil
+    entry.career = 0
+    entry.unitType = nil
     if type(meta) == "table" then
         entry.fromCombat = meta.fromCombat == true
         entry.isPvP = meta.isPvP == true
@@ -397,11 +666,19 @@ function UnrealFX.rememberRecentNamedHit(worldObjNum, name, meta)
         entry.career = tonumber(meta.career) or 0
         entry.unitType = meta.unitType
     end
-    list[#list + 1] = entry
-    local maxN = UnrealFX.FX_RECENT_WORLD_OBJ_MAX or 96
-    while #list > maxN do
-        table.remove(list, 1)
+    namedHitSlotById[id] = namedHitHead
+end
+
+function UnrealFX.getRecentNamedHitCount()
+    return namedHitCount
+end
+
+-- k = 1 is the newest entry. Entries with id == 0 were superseded; skip them.
+function UnrealFX.getRecentNamedHit(k)
+    if k < 1 or k > namedHitCount then
+        return nil
     end
+    return namedHitRing[((namedHitHead - k) % NAMED_HIT_CAP) + 1]
 end
 
 function UnrealFX.getPlayerWorldObjNum()
@@ -411,52 +688,109 @@ function UnrealFX.getPlayerWorldObjNum()
     return 0
 end
 
--- Current hostile entity id (any HP). Used when victim world id is unknown.
+-- Current hostile entity id (any HP) from the last PLAYER_TARGET_UPDATED snapshot.
 function UnrealFX.getCurrentHostileWorldId()
-    if not (TargetInfo and type(TargetInfo.UnitEntityId) == "function") then
-        return 0
-    end
-    if type(TargetInfo.UpdateFromClient) == "function" then
-        pcall(function() TargetInfo:UpdateFromClient() end)
-    end
-    local slot = TargetInfo.HOSTILE_TARGET or "selfhostiletarget"
-    return tonumber(TargetInfo:UnitEntityId(slot)) or 0
+    return UnrealFX.targetSnap.hostile.id or 0
 end
 
 -- Living current hostile (HP > 0). resolveWorldObjForKill prefers other candidates
 -- so AOE same-name kills are not stamped onto a still-living target.
 function UnrealFX.getLivingHostileWorldId()
-    local id = UnrealFX.getCurrentHostileWorldId()
-    if id == 0 then
-        return 0
-    end
-    if not (TargetInfo and type(TargetInfo.UnitHealth) == "function") then
-        return 0
-    end
-    local slot = TargetInfo.HOSTILE_TARGET or "selfhostiletarget"
-    local hp = tonumber(TargetInfo:UnitHealth(slot))
-    if hp == nil or hp > 0 then
-        -- Missing HP: do not treat as living-avoid (targeted kill path needs the id).
-        if hp == nil then
-            return 0
-        end
-        return id
+    local snap = UnrealFX.targetSnap.hostile
+    -- Unknown HP (-1): do not treat as living-avoid (targeted kill path needs the id).
+    if snap.id ~= 0 and snap.hp > 0 then
+        return snap.id
     end
     return 0
 end
 
--- When the kill victim id is unknown / projection fails: current hostile, else self.
-function UnrealFX.resolveFxDisplayFallbackWorldId(excludeId)
+-- Time the id was last seen at 0% HP in a target slot, or nil.
+function UnrealFX.getZeroHpTime(id)
+    return idRingGet(zeroHpRing, tonumber(id) or 0)
+end
+
+-- XP / renown floating-text events: (hitTargetObjectNumber, pointsGained). Stock uses
+-- them for the reward text above an object; when that object is not the player it is
+-- kill evidence for that id. The player's own id is never stored.
+function UnrealFX.onWorldObjReward(kind, hitTargetObjectNumber, pointsGained)
+    local id = tonumber(hitTargetObjectNumber) or 0
+    if UnrealFX.probeEnabled then
+        UnrealFX.probeReward(kind, id, pointsGained)
+    end
+    if id == 0 or id == UnrealFX.getPlayerWorldObjNum() then
+        return false
+    end
+    idRingSet(rewardRing, id, UnrealFX.fxClock or 0)
+    return true
+end
+
+function UnrealFX.OnWorldObjXpGained(hitTargetObjectNumber, pointsGained)
+    UnrealFX.onWorldObjReward("xp", hitTargetObjectNumber, pointsGained)
+end
+
+function UnrealFX.OnWorldObjRenownGained(hitTargetObjectNumber, pointsGained)
+    UnrealFX.onWorldObjReward("renown", hitTargetObjectNumber, pointsGained)
+end
+
+function UnrealFX.getRewardTime(id)
+    id = tonumber(id) or 0
+    if id == 0 or id == UnrealFX.getPlayerWorldObjNum() then
+        return nil
+    end
+    return idRingGet(rewardRing, id)
+end
+
+-- Kill-time evidence window for 0% HP / XP / renown on a candidate id.
+UnrealFX.FX_KILL_EVIDENCE_SECONDS = 3.0
+UnrealFX.FX_REWARD_EVIDENCE_BONUS = 1200
+UnrealFX.FX_ZERO_HP_EVIDENCE_BONUS = 800
+
+-- Bonus for a candidate id that just gave XP/renown or reported 0% HP.
+function UnrealFX.killEvidenceBonus(id, now)
+    id = tonumber(id) or 0
+    if id == 0 or id == UnrealFX.getPlayerWorldObjNum() then
+        return 0
+    end
+    now = now or (UnrealFX.fxClock or 0)
+    local win = UnrealFX.FX_KILL_EVIDENCE_SECONDS or 3.0
+    local bonus = 0
+    local rt = idRingGet(rewardRing, id)
+    if rt and (now - rt) <= win then
+        bonus = bonus + (UnrealFX.FX_REWARD_EVIDENCE_BONUS or 1200)
+    end
+    local zt = idRingGet(zeroHpRing, id)
+    if zt and (now - zt) <= win then
+        bonus = bonus + (UnrealFX.FX_ZERO_HP_EVIDENCE_BONUS or 800)
+    end
+    return bonus
+end
+
+-- Kill victim id still unknown after the pending retries. The hostile target is
+-- used only when it is at 0% HP, or is the victim: name match, not hit after killT,
+-- and no target update since killT (a fresh update without 0% HP means a living
+-- same-named unit). A living, different hostile is never used. Else self (last resort).
+function UnrealFX.resolveFxDisplayFallbackWorldId(excludeId, wantKey, killT)
     excludeId = tonumber(excludeId) or 0
-    local hid = UnrealFX.getCurrentHostileWorldId()
-    if hid ~= 0 and hid ~= excludeId then
-        return hid
+    local snap = UnrealFX.targetSnap.hostile
+    local hid = tonumber(snap.id) or 0
+    if hid ~= 0 and hid ~= excludeId and hid ~= UnrealFX.getPlayerWorldObjNum() then
+        local now = UnrealFX.fxClock or 0
+        local zt = UnrealFX.getZeroHpTime(hid)
+        local atZero = (snap.hp ~= nil and snap.hp >= 0 and snap.hp <= 0)
+            or (zt ~= nil and (now - zt) <= (UnrealFX.FX_KILL_EVIDENCE_SECONDS or 3.0))
+        killT = tonumber(killT)
+        local isVictim = not atZero and killT ~= nil and wantKey ~= nil and wantKey ~= L""
+            and snap.key == wantKey and (tonumber(snap.t) or 0) <= killT
+            and not UnrealFX.wasHitAfterKill(hid, killT)
+        if atZero or isVictim then
+            return hid, atZero and "target-0hp" or "target-victim"
+        end
     end
     local selfId = UnrealFX.getSelfWorldObjNum()
     if selfId ~= 0 and selfId ~= excludeId then
-        return selfId
+        return selfId, "self"
     end
-    return 0
+    return 0, "none"
 end
 
 function UnrealFX.consumeCombatHitWorldId(worldId)
@@ -464,20 +798,15 @@ function UnrealFX.consumeCombatHitWorldId(worldId)
     if worldId == 0 then
         return
     end
-    local hits = UnrealFX.recentNamedHits
-    if type(hits) ~= "table" then
-        return
-    end
-    for i = 1, #hits do
-        local hit = hits[i]
-        if hit and (tonumber(hit.id) or 0) == worldId then
-            hit.consumed = true
-        end
+    local slot = namedHitSlotById[worldId]
+    local hit = slot and namedHitRing[slot]
+    if hit and hit.id == worldId then
+        hit.consumed = true
     end
 end
 
--- Soft-arm still uses Attach (hidden). Playing kill FX follows stock chat bubbles:
--- MoveWindowToWorldObject each tick (no Attach), which avoids sticky top-left binds.
+-- Older clients without MoveWindowToWorldObject only: Attach rebind. Normally kill FX
+-- follow stock chat bubbles (Move each tick, no Attach), avoiding sticky top-left binds.
 function UnrealFX.rebindFxToWorldObject(win, worldId)
     worldId = tonumber(worldId) or 0
     if not win or not DoesWindowExist(win) or worldId == 0 then
@@ -526,44 +855,156 @@ function UnrealFX.isFxWindowStuckAtOrigin(win)
     return x >= 0 and x < 2 and y >= 0 and y < 2
 end
 
--- Drop any Attach and project onto toWorldId instead.
-function UnrealFX.fallbackFxProjectToWorldId(win, fromWorldId, toWorldId)
-    toWorldId = tonumber(toWorldId) or 0
-    if toWorldId == 0 or not win or not DoesWindowExist(win) then
-        return 0
-    end
-    fromWorldId = tonumber(fromWorldId) or 0
-    if type(DetachWindowFromWorldObject) == "function" then
-        if fromWorldId ~= 0 then
-            pcall(DetachWindowFromWorldObject, win, fromWorldId)
+-- Sentinel offset written before each Move. If the window still sits there after the
+-- client drew, Move did not place it (object missing), which is different from a
+-- victim legitimately near the top-left corner.
+UnrealFX.FX_SENTINEL_OFFSET = -4096
+UnrealFX.FX_SENTINEL_THRESHOLD = -2000
+-- Consecutive unplaced ticks before the FX is pinned to a fixed screen spot.
+-- Off-screen does not count: Move then hides the window (see sampleFxProjection).
+UnrealFX.FX_MISSING_TICKS = 2
+-- A pinned FX checks every this many seconds (doubling after each failed check)
+-- whether its world object is back, and follows it again if so.
+UnrealFX.FX_PIN_RETRY_SECONDS = 0.5
+
+function UnrealFX.canUseFxSentinel()
+    return type(WindowSetOffsetFromParent) == "function"
+        and type(MoveWindowToWorldObject) == "function"
+        and type(WindowGetScreenPosition) == "function"
+end
+
+function UnrealFX.isSentinelPosition(x, y)
+    local lim = UnrealFX.FX_SENTINEL_THRESHOLD or -2000
+    return x == nil or y == nil or (x <= lim and y <= lim)
+end
+
+function UnrealFX.getUiScale()
+    local scale = 1
+    if InterfaceCore and type(InterfaceCore.GetScale) == "function" then
+        local ok, s = pcall(InterfaceCore.GetScale)
+        s = ok and tonumber(s) or nil
+        if s and s > 0 then
+            scale = s
         end
-        if toWorldId ~= fromWorldId then
-            pcall(DetachWindowFromWorldObject, win, toWorldId)
+    end
+    return scale
+end
+
+-- Victim cannot be placed: stop following and pin to Root at the last good screen
+-- position, else the stock EA_System_EventTextAnchor<id> spot, else screen center.
+-- Returns a short ASCII reason.
+function UnrealFX.anchorFxFixed(inst, win, worldId)
+    if not win or not DoesWindowExist(win) then
+        return "nowin"
+    end
+    worldId = tonumber(worldId) or 0
+    if worldId ~= 0 and type(DetachWindowFromWorldObject) == "function" then
+        pcall(DetachWindowFromWorldObject, win, worldId)
+    end
+    local scale = UnrealFX.getUiScale()
+    local dispW, dispH = UnrealFX.getFxDisplaySize()
+    local x, y, reason = nil, nil, "center"
+    if inst.hasLastPos then
+        x = inst.lastX / scale
+        y = inst.lastY / scale
+        reason = "lastpos"
+    elseif worldId ~= 0 and type(WindowGetScreenPosition) == "function" then
+        local anchor = "EA_System_EventTextAnchor" .. worldId
+        if DoesWindowExist(anchor) then
+            local ax, ay = WindowGetScreenPosition(anchor)
+            ax = tonumber(ax)
+            ay = tonumber(ay)
+            if ax and ay and not UnrealFX.isSentinelPosition(ax, ay) then
+                local aw, ah = 0, 0
+                if type(WindowGetDimensions) == "function" then
+                    local w, h = WindowGetDimensions(anchor)
+                    aw = tonumber(w) or 0
+                    ah = tonumber(h) or 0
+                end
+                x = ax / scale + (aw - dispW) / 2
+                y = ay / scale + (ah - dispH) / 2
+                reason = "eventtext"
+            end
         end
     end
-    if not UnrealFX.projectFxToWorldObject(win, toWorldId) then
-        return 0
+    if type(WindowClearAnchors) == "function" and type(WindowAddAnchor) == "function" then
+        WindowClearAnchors(win)
+        if x then
+            WindowAddAnchor(win, "topleft", "Root", "topleft", x, y)
+        else
+            WindowAddAnchor(win, "center", "Root", "center", 0, 0)
+        end
     end
-    return toWorldId
+    -- Move may have hidden the window (off-screen) before the object went missing.
+    WindowSetShowing(win, true)
+    inst.fixedAnchor = true
+    local gap = inst.pinRetryGap or UnrealFX.FX_PIN_RETRY_SECONDS or 0.5
+    inst.pinRetryAt = (inst.t or 0) + gap
+    inst.pinRetryGap = gap * 2
+    return reason
 end
 
--- Stuck / unknown id: current hostile first, then self.
-function UnrealFX.fallbackFxProjectToHostileOrSelf(win, fromWorldId)
-    local toId = UnrealFX.resolveFxDisplayFallbackWorldId(fromWorldId)
-    if toId == 0 then
-        return 0
+-- Pinned FX: at most one GetNameForObject per retry interval. When the object is
+-- known again, drop the pin and follow it; the next samples decide (and re-pin at
+-- the last position if Move still cannot place it). Returns true when unpinned.
+function UnrealFX.retryPinnedFx(inst, win, worldId)
+    local t = inst.t or 0
+    if t < (inst.pinRetryAt or 0) then
+        return false
     end
-    return UnrealFX.fallbackFxProjectToWorldId(win, fromWorldId, toId)
+    local gap = inst.pinRetryGap or UnrealFX.FX_PIN_RETRY_SECONDS or 0.5
+    inst.pinRetryAt = t + gap
+    inst.pinRetryGap = gap * 2
+    if type(GetNameForObject) ~= "function" then
+        return false
+    end
+    local ok, name = pcall(GetNameForObject, worldId)
+    if not ok or name == nil or name == L"" then
+        return false
+    end
+    if type(WindowClearAnchors) == "function" then
+        WindowClearAnchors(win)
+    end
+    inst.fixedAnchor = false
+    inst.fixedReason = nil
+    inst.missingTicks = 0
+    if UnrealFX.probeEnabled then
+        UnrealFX.probeLine("unpin id " .. tostring(worldId))
+    end
+    return true
 end
 
--- Drop any Attach and project onto the local player instead.
-function UnrealFX.fallbackFxProjectToSelf(win, fromWorldId)
-    return UnrealFX.fallbackFxProjectToWorldId(win, fromWorldId, UnrealFX.getSelfWorldObjNum())
-end
-
--- Back-compat name used by earlier drafts.
-function UnrealFX.fallbackFxAttachToSelf(win, fromWorldId)
-    return UnrealFX.fallbackFxProjectToSelf(win, fromWorldId)
+-- One WindowGetScreenPosition per active FX per tick: remember where the client drew
+-- the previous projection. Still at the sentinel: hidden means the object is
+-- off-screen (Move hides the window and leaves it in place), so keep following;
+-- shown means Move did not place it (object missing), which counts as a miss.
+function UnrealFX.sampleFxProjection(inst, win)
+    local x, y = WindowGetScreenPosition(win)
+    x = tonumber(x)
+    y = tonumber(y)
+    local canShow = type(WindowGetShowing) == "function"
+    if UnrealFX.isSentinelPosition(x, y) then
+        if canShow and not WindowGetShowing(win) then
+            inst.offscreen = true
+            inst.missingTicks = 0
+            return false
+        end
+        inst.offscreen = false
+        inst.missingTicks = (inst.missingTicks or 0) + 1
+        return false
+    end
+    if inst.offscreen then
+        -- Back on screen. Show it in case the client only hides on Move.
+        inst.offscreen = false
+        if canShow and not WindowGetShowing(win) then
+            WindowSetShowing(win, true)
+        end
+    end
+    inst.missingTicks = 0
+    inst.lastX = x
+    inst.lastY = y
+    inst.hasLastPos = true
+    return true
 end
 
 function UnrealFX.markFxDoneWorldId(worldId)
@@ -622,76 +1063,77 @@ function UnrealFX.isUsableVictimWorldId(id, usedIds, avoidId)
     return true
 end
 
--- Same source SCT uses: live EventTracker.m_TargetObject + WORLD_OBJ_COMBAT_EVENT ids.
-function UnrealFX.pruneDamagePairBuffer(list, maxN, maxAge)
-    if type(list) ~= "table" then
-        return
+-- Ability names compared as trimmed lowercase narrow strings; nil when unknown.
+function UnrealFX.normalizeAbilityKey(ability)
+    if ability == nil or ability == L"" or ability == "" then
+        return nil
     end
-    maxN = maxN or UnrealFX.FX_DAMAGE_PAIR_MAX or 24
-    maxAge = maxAge or UnrealFX.FX_DAMAGE_PAIR_SECONDS or 3.0
-    local now = UnrealFX.fxClock or 0
-    local i = 1
-    while i <= #list do
-        local e = list[i]
-        local age = now - (e and tonumber(e.t) or 0)
-        if not e or age > maxAge then
-            table.remove(list, i)
-        else
-            i = i + 1
+    local s = string.lower(UnrealFX.toNarrow(ability))
+    s = string.gsub(s, "^%s+", "")
+    s = string.gsub(s, "%s+$", "")
+    if s == "" then
+        return nil
+    end
+    return s
+end
+
+-- abilityId -> normalized name (false when GetAbilityData has none). Bounded by the
+-- abilities that actually hit something.
+local abilityKeyById = {}
+function UnrealFX.getAbilityKeyById(abilityId)
+    abilityId = tonumber(abilityId) or 0
+    if abilityId <= 0 or type(GetAbilityData) ~= "function" then
+        return nil
+    end
+    local cached = abilityKeyById[abilityId]
+    if cached == nil then
+        cached = false
+        local ok, data = pcall(GetAbilityData, abilityId)
+        if ok and type(data) == "table" then
+            cached = UnrealFX.normalizeAbilityKey(data.name) or false
         end
+        abilityKeyById[abilityId] = cached
     end
-    while #list > maxN do
-        table.remove(list, 1)
-    end
+    return cached or nil
 end
 
-function UnrealFX.pushDamagePairBuffer(list, entry)
-    if type(list) ~= "table" or type(entry) ~= "table" then
-        return
-    end
-    list[#list + 1] = entry
-    UnrealFX.pruneDamagePairBuffer(list)
-end
-
--- Outgoing damage event: world id + absolute damage amount.
-function UnrealFX.rememberRecentDamageEvent(worldId, amount)
+-- Outgoing damage event: world id + absolute damage amount (+ ability when the event
+-- carries an abilityId). Reuses a ring slot.
+function UnrealFX.rememberRecentDamageEvent(worldId, amount, abilityKey)
     worldId = tonumber(worldId) or 0
     amount = math.abs(tonumber(amount) or 0)
     if worldId == 0 or amount == 0 or worldId == UnrealFX.getPlayerWorldObjNum() then
         return
     end
-    local list = UnrealFX.recentDamageEvents
-    if type(list) ~= "table" then
-        list = {}
-        UnrealFX.recentDamageEvents = list
-    end
-    UnrealFX.pushDamagePairBuffer(list, {
-        id = worldId,
-        amount = amount,
-        t = UnrealFX.fxClock or 0,
-        used = false,
-    })
+    local entry = entryRingNext(UnrealFX.recentDamageEvents)
+    entry.id = worldId
+    entry.amount = amount
+    entry.ability = abilityKey or false
+    entry.t = UnrealFX.fxClock or 0
+    entry.used = false
 end
 
 -- Combat YOUR_HITS / PET_HITS: "Your X hits Target for N damage."
+-- Returns targetKey, amount, abilityKey, petName (narrow, pet lines only).
+-- No table: this runs on every hit line.
 function UnrealFX.parseOutgoingDamageCombatLog(msg, isPetHit)
     local s = UnrealFX.toNarrow(msg)
     if s == "" then
         return nil
     end
-    local targetName, damageStr
+    local ability, targetName, damageStr, pet
     if isPetHit then
-        _, _, targetName, damageStr =
+        pet, ability, targetName, damageStr =
             string.match(s, "^Your (.+)'s (.+) critically hits (.+) for (%d+) damage")
         if targetName == nil then
-            _, _, targetName, damageStr =
+            pet, ability, targetName, damageStr =
                 string.match(s, "^Your (.+)'s (.+) hits (.+) for (%d+) damage")
         end
     else
-        _, targetName, damageStr =
+        ability, targetName, damageStr =
             string.match(s, "^Your (.+) critically hits (.+) for (%d+) damage")
         if targetName == nil then
-            _, targetName, damageStr =
+            ability, targetName, damageStr =
                 string.match(s, "^Your (.+) hits (.+) for (%d+) damage")
         end
     end
@@ -702,29 +1144,65 @@ function UnrealFX.parseOutgoingDamageCombatLog(msg, isPetHit)
     if amount == 0 then
         return nil
     end
-    return {
-        key = UnrealFX.normalizeUnitName(targetName),
-        amount = amount,
-    }
+    return UnrealFX.normalizeUnitName(targetName), amount, UnrealFX.normalizeAbilityKey(ability), pet
 end
 
-function UnrealFX.rememberRecentDamageChat(nameOrKey, amount)
+-- Pet name learned from "Your <Pet>'s ..." hit lines; key is rebuilt only on change.
+UnrealFX.learnedPetName = nil
+UnrealFX.learnedPetKey = L""
+
+function UnrealFX.learnPetName(pet)
+    if pet == nil or pet == "" or pet == UnrealFX.learnedPetName then
+        return
+    end
+    UnrealFX.learnedPetName = pet
+    UnrealFX.learnedPetKey = UnrealFX.normalizeUnitName(pet)
+end
+
+-- Normalized names the player's pet may appear under in kill lines.
+function UnrealFX.isPlayerPetKey(killerKey)
+    if killerKey == nil or killerKey == L"" then
+        return false
+    end
+    local pet = GameData and GameData.Player and GameData.Player.Pet
+    local petName = pet and pet.name
+    if petName ~= nil and petName ~= L"" and UnrealFX.normalizeUnitName(petName) == killerKey then
+        return true
+    end
+    return UnrealFX.learnedPetKey ~= L"" and UnrealFX.learnedPetKey == killerKey
+end
+
+-- Pet kill lines only count when we (or the pet) hit that victim recently, so another
+-- player's same-named pet does not trigger our FX.
+UnrealFX.FX_PET_KILL_RECENT_HIT_SECONDS = 10
+
+function UnrealFX.hasRecentDamageChatFor(key, maxAge)
+    local ring = UnrealFX.recentDamageChats
+    local now = UnrealFX.fxClock or 0
+    for k = 1, ring.count do
+        local entry = entryRingAt(ring, k)
+        if (now - (entry.t or 0)) > maxAge then
+            return false
+        end
+        if entry.key == key then
+            return true
+        end
+    end
+    return false
+end
+
+function UnrealFX.rememberRecentDamageChat(nameOrKey, amount, abilityKey)
     local key = UnrealFX.normalizeUnitName(nameOrKey)
     amount = math.abs(tonumber(amount) or 0)
     if key == L"" or amount == 0 then
         return
     end
-    local list = UnrealFX.recentDamageChats
-    if type(list) ~= "table" then
-        list = {}
-        UnrealFX.recentDamageChats = list
-    end
-    UnrealFX.pushDamagePairBuffer(list, {
-        key = key,
-        amount = amount,
-        t = UnrealFX.fxClock or 0,
-        used = false,
-    })
+    local entry = entryRingNext(UnrealFX.recentDamageChats)
+    entry.key = key
+    entry.amount = amount
+    entry.ability = abilityKey or false
+    entry.t = UnrealFX.fxClock or 0
+    entry.used = false
 end
 
 function UnrealFX.onOutgoingDamageCombatLog(filterType)
@@ -741,16 +1219,20 @@ function UnrealFX.onOutgoingDamageCombatLog(filterType)
         return
     end
     local _, _, msg = TextLogGetEntry("Combat", num)
-    local hit = UnrealFX.parseOutgoingDamageCombatLog(msg, isPet)
-    if not hit then
+    local key, amount, abilityKey, pet = UnrealFX.parseOutgoingDamageCombatLog(msg, isPet)
+    if not key then
         return
     end
-    UnrealFX.rememberRecentDamageChat(hit.key, hit.amount)
+    if pet then
+        UnrealFX.learnPetName(pet)
+    end
+    UnrealFX.rememberRecentDamageChat(key, amount, abilityKey)
 end
 
 -- Score a chat line (name+amount) against a damage event (id+amount). Higher is better.
--- Returns nil if incompatible.
-function UnrealFX.scoreDamagePair(chat, event, wantKey, now)
+-- killAbility: normalized ability from the kill line (nil when unknown). Returns nil if
+-- incompatible. Unknown abilities leave the score unchanged.
+function UnrealFX.scoreDamagePair(chat, event, wantKey, now, killAbility)
     if type(chat) ~= "table" or type(event) ~= "table" then
         return nil
     end
@@ -794,24 +1276,38 @@ function UnrealFX.scoreDamagePair(chat, event, wantKey, now)
         end
     end
 
+    local chatAbility = chat.ability or nil
+    local eventAbility = event.ability or nil
+    if chatAbility and eventAbility then
+        if chatAbility == eventAbility then
+            score = score + (UnrealFX.FX_PAIR_ABILITY_AGREE_BONUS or 500)
+        else
+            score = score - (UnrealFX.FX_PAIR_ABILITY_DISAGREE_PENALTY or 800)
+        end
+    end
+    score = score + UnrealFX.killEvidenceBonus(id, now)
+
+    local pairAbility = chatAbility or eventAbility
+    if killAbility and pairAbility then
+        if pairAbility == killAbility then
+            score = score + (UnrealFX.FX_ABILITY_MATCH_BONUS or 3000)
+        else
+            score = score - (UnrealFX.FX_ABILITY_MISMATCH_PENALTY or 1500)
+        end
+    end
+
     return score
 end
 
 -- Among recent damage chats for victimName, pick the best amount-matched event id.
--- Skip the living current hostile (HP > 0) — that is still targeted, not the corpse.
-function UnrealFX.findBestDamagePairWorldId(victimName, usedIds)
+-- Skip the living current hostile (HP > 0) - that is still targeted, not the corpse.
+function UnrealFX.findBestDamagePairWorldId(victimName, usedIds, killAbility, killT)
     local want = UnrealFX.normalizeUnitName(victimName)
     if want == L"" then
         return 0
     end
-    UnrealFX.pruneDamagePairBuffer(UnrealFX.recentDamageEvents)
-    UnrealFX.pruneDamagePairBuffer(UnrealFX.recentDamageChats)
-
     local chats = UnrealFX.recentDamageChats
     local events = UnrealFX.recentDamageEvents
-    if type(chats) ~= "table" or type(events) ~= "table" then
-        return 0
-    end
 
     local now = UnrealFX.fxClock or 0
     local maxChats = UnrealFX.FX_DAMAGE_PAIR_CHAT_CANDIDATES or 8
@@ -819,20 +1315,24 @@ function UnrealFX.findBestDamagePairWorldId(victimName, usedIds)
     local bestScore, bestEvent, bestChat = nil, nil, nil
     local considered = 0
 
-    for ci = #chats, 1, -1 do
-        local chat = chats[ci]
+    for ci = 1, chats.count do
+        local chat = entryRingAt(chats, ci)
         if chat and not chat.used and chat.key == want then
             considered = considered + 1
             if considered > maxChats then
                 break
             end
-            for ei = #events, 1, -1 do
-                local event = events[ei]
-                local score = UnrealFX.scoreDamagePair(chat, event, want, now)
+            for ei = 1, events.count do
+                local event = entryRingAt(events, ei)
+                local score = UnrealFX.scoreDamagePair(chat, event, want, now, killAbility)
                 if score ~= nil then
                     local id = tonumber(event.id) or 0
                     -- Living current target: keep searching for another pair.
                     if livingTargetId ~= 0 and id == livingTargetId then
+                        id = 0
+                    end
+                    -- Hit again after the kill: still alive, not the victim.
+                    if id ~= 0 and UnrealFX.wasHitAfterKill(id, killT) then
                         id = 0
                     end
                     if id ~= 0
@@ -859,7 +1359,7 @@ function UnrealFX.findBestDamagePairWorldId(victimName, usedIds)
     return id
 end
 
--- Newest-first. Does not touch recentNamedHits (avoids reordering / target pollution).
+-- Newest-first. Does not touch the named-hit ring (avoids reordering / target pollution).
 function UnrealFX.collectCombatHitWorldObjsNewestFirst()
     local ordered = {}
     local orderedSeen = {}
@@ -875,15 +1375,21 @@ function UnrealFX.collectCombatHitWorldObjsNewestFirst()
         ordered[#ordered + 1] = id
     end
 
-    local recent = UnrealFX.recentWorldObjIds or {}
-    for i = #recent, 1, -1 do
-        push(recent[i])
+    local cap = UnrealFX.FX_KILL_PROBE_CAP or 48
+    for k = 1, hitRing.count do
+        if #ordered >= cap then
+            break
+        end
+        push((idRingAt(hitRing, k)))
     end
 
     local trackerIds = {}
     local trackerSeen = {}
     UnrealFX.collectEventTrackerIds(trackerIds, trackerSeen)
     for i = 1, #trackerIds do
+        if #ordered >= cap * 2 then
+            break
+        end
         push(trackerIds[i])
     end
 
@@ -892,48 +1398,89 @@ end
 
 -- Kill FX world id. Prefer best damage-event/combat-chat amount+name pair, then
 -- soft-arm / SCT / dead hostile. Self fallback is handled by playKillFx / announce.
-function UnrealFX.resolveWorldObjForKill(victimName, usedIds)
+-- opts (optional): { ability = normalized kill-line ability, killT = fxClock of the
+-- kill line }. With killT, ids damaged again after the kill are skipped.
+-- Returns id, reason (short ASCII tag for the probe).
+function UnrealFX.resolveWorldObjForKill(victimName, usedIds, opts)
     local want = UnrealFX.normalizeUnitName(victimName)
     if want == L"" then
-        return 0
+        return 0, "noname"
     end
     usedIds = usedIds or {}
-    -- Refresh after /reload: PLAYER_TARGET_UPDATED may not have fired yet.
-    UnrealFX.captureHostileTarget()
+    local killAbility = opts and opts.ability or nil
+    local killT = opts and opts.killT or nil
     local avoidId = UnrealFX.getLivingHostileWorldId()
     local combatIds = UnrealFX.collectCombatHitWorldObjsNewestFirst()
 
     local function usable(id, allowAvoid)
+        if killT and UnrealFX.wasHitAfterKill(id, killT) then
+            return false
+        end
         if allowAvoid then
             return UnrealFX.isUsableVictimWorldId(id, usedIds, 0)
         end
         return UnrealFX.isUsableVictimWorldId(id, usedIds, avoidId)
     end
 
-    local function softArmMatches(inst, id)
-        if inst.armKey == want or UnrealFX.namesEqual(inst.armName, want) then
-            return true
+    local probesLeft = UnrealFX.FX_KILL_PROBE_CAP or 48
+    local function softArmMatches(slot, id)
+        local key = slot and hitRing.key[slot]
+        if key then
+            return key == want
         end
+        if probesLeft <= 0 then
+            return false
+        end
+        probesLeft = probesLeft - 1
         return UnrealFX.probeWorldObjName(id, want) ~= 0
     end
 
     -- 0) Best YOUR_HITS chat + WORLD_OBJ_COMBAT_EVENT amount pair for this victim.
-    local pairId = UnrealFX.findBestDamagePairWorldId(want, usedIds)
+    local pairId = UnrealFX.findBestDamagePairWorldId(want, usedIds, killAbility, killT)
     if pairId ~= 0 then
-        return pairId
+        return pairId, "pair"
     end
 
-    -- 1) Soft-armed binds: prefer ids that are not the living hostile (AOE same-name),
-    -- then allow the living hostile itself when we soft-armed it (targeted kill + HP lag).
-    local active = UnrealFX.fxActive or {}
+    local now = UnrealFX.fxClock or 0
+
+    -- 0b) Kill evidence: ids that just gave XP/renown or showed 0% HP, newest first,
+    -- when their name matches (cached hit name, else a capped probe).
+    do
+        local win = UnrealFX.FX_KILL_EVIDENCE_SECONDS or 3.0
+        local rings = UnrealFX._evidenceRings
+        for r = 1, #rings do
+            local ring = rings[r]
+            for k = 1, ring.count do
+                local id, t = idRingAt(ring, k)
+                if id and t and (now - t) <= win and usable(id, true) then
+                    local slot = hitRing.slotById[id]
+                    local matches
+                    if slot and hitRing.key[slot] then
+                        matches = hitRing.key[slot] == want
+                    else
+                        matches = softArmMatches(slot, id)
+                    end
+                    if matches then
+                        return id, (r == 1) and "reward" or "zerohp"
+                    end
+                end
+            end
+        end
+    end
+
+    -- 1) Soft-armed ids (damaged within FX_ARM_SECONDS): prefer ids that are not the
+    -- living hostile (AOE same-name), then allow the living hostile itself when it was
+    -- soft-armed (targeted kill + HP lag).
+    local armDur = UnrealFX.FX_ARM_SECONDS or 8.0
     local softAvoidMatch = 0
-    for i = #active, 1, -1 do
-        local inst = active[i]
-        if inst and inst.phase == "armed" then
-            local id = tonumber(inst.attachedId) or 0
-            if softArmMatches(inst, id) then
+    for k = 1, hitRing.count do
+        local id, _ = idRingAt(hitRing, k)
+        local slot = hitRing.slotById[id]
+        local armT = slot and hitRing.armT[slot]
+        if armT and now - armT <= armDur and not UnrealFX.isFxDoneWorldId(id) then
+            if softArmMatches(slot, id) then
                 if usable(id, false) then
-                    return id
+                    return id, "softarm"
                 end
                 if softAvoidMatch == 0 and avoidId ~= 0 and id == avoidId and usable(id, true) then
                     softAvoidMatch = id
@@ -942,28 +1489,25 @@ function UnrealFX.resolveWorldObjForKill(victimName, usedIds)
         end
     end
     if softAvoidMatch ~= 0 then
-        return softAvoidMatch
+        return softAvoidMatch, "softarm-target"
     end
 
     -- 2) Named combat hits learned while alive (unconsumed), newest first.
-    local hits = UnrealFX.recentNamedHits
     local namedAvoidMatch = 0
-    if type(hits) == "table" then
-        for i = #hits, 1, -1 do
-            local hit = hits[i]
-            if hit and hit.fromCombat and not hit.consumed and hit.key == want then
-                local id = tonumber(hit.id) or 0
-                if usable(id, false) then
-                    return id
-                end
-                if namedAvoidMatch == 0 and avoidId ~= 0 and id == avoidId and usable(id, true) then
-                    namedAvoidMatch = id
-                end
+    for k = 1, namedHitCount do
+        local hit = UnrealFX.getRecentNamedHit(k)
+        if hit and hit.id ~= 0 and hit.fromCombat and not hit.consumed and hit.key == want then
+            local id = hit.id
+            if usable(id, false) then
+                return id, "named"
+            end
+            if namedAvoidMatch == 0 and avoidId ~= 0 and id == avoidId and usable(id, true) then
+                namedAvoidMatch = id
             end
         end
     end
     if namedAvoidMatch ~= 0 then
-        return namedAvoidMatch
+        return namedAvoidMatch, "named-target"
     end
 
     -- 3) Probe recent combat + CustomUI SCT EventTracker ids by name (same source
@@ -972,9 +1516,13 @@ function UnrealFX.resolveWorldObjForKill(victimName, usedIds)
     if type(GetNameForObject) == "function" then
         for i = 1, #combatIds do
             local id = combatIds[i]
+            if probesLeft <= 0 then
+                break
+            end
+            probesLeft = probesLeft - 1
             if UnrealFX.probeWorldObjName(id, want) ~= 0 then
                 if usable(id, false) then
-                    return id
+                    return id, "probe"
                 end
                 if probeAvoidMatch == 0 and avoidId ~= 0 and id == avoidId and usable(id, true) then
                     probeAvoidMatch = id
@@ -983,97 +1531,55 @@ function UnrealFX.resolveWorldObjForKill(victimName, usedIds)
         end
     end
     if probeAvoidMatch ~= 0 then
-        return probeAvoidMatch
+        return probeAvoidMatch, "probe-target"
     end
 
-    -- 4) Dead / cleared hostile matching the kill name (targeted kill).
-    if TargetInfo and type(TargetInfo.UnitEntityId) == "function" then
-        if type(TargetInfo.UpdateFromClient) == "function" then
-            pcall(function() TargetInfo:UpdateFromClient() end)
-        end
-        local slot = TargetInfo.HOSTILE_TARGET or "selfhostiletarget"
-        local tid = tonumber(TargetInfo:UnitEntityId(slot)) or 0
-        local tname = TargetInfo:UnitName(slot)
-        if tid ~= 0 and UnrealFX.namesEqual(tname, want) then
-            local hp = type(TargetInfo.UnitHealth) == "function" and tonumber(TargetInfo:UnitHealth(slot)) or nil
+    -- 4) Dead / cleared hostile matching the kill name (targeted kill), from the snapshot.
+    do
+        local snap = UnrealFX.targetSnap.hostile
+        local tid = snap.id
+        local tname = snap.name
+        if tid ~= 0 and snap.key == want then
+            local hp = snap.hp >= 0 and snap.hp or nil
             -- HP <= 0: corpse still targeted. HP > 0: kill line often races the HP update;
             -- only accept when combat evidence already pointed at this same id (steps 1-3
             -- would have returned it via allowAvoid - reaching here means no soft-arm/hit,
             -- so require hp <= 0 or lastHostile agreement below).
-            if hp ~= nil and hp <= 0 and UnrealFX.isUsableVictimWorldId(tid, usedIds, 0) then
-                return tid
+            if hp ~= nil and hp <= 0 and usable(tid, true) then
+                return tid, "deadtarget"
             end
         elseif tid == 0 or tname == nil or tname == L"" then
             local last = UnrealFX.lastHostile
             if type(last) == "table" and UnrealFX.namesEqual(last.name, want) then
                 local lid = tonumber(last.id) or 0
-                if UnrealFX.isUsableVictimWorldId(lid, usedIds, 0) then
+                if usable(lid, true) then
                     -- Cleared target: corpse id from lastHostile (HP lag / slot wipe).
-                    return lid
+                    return lid, "lasttarget"
                 end
             end
         end
     end
 
-    return 0
+    return 0, "none"
 end
 
--- GroupIcons-style: attach while the world object still exists (on the hit). The
--- same worldObjNum remains valid on the corpse; kill chat only supplies the name.
-function UnrealFX.armCombatWorldObj(worldId, name)
+-- Soft-arm: data only. Stamps the hit-ring slot; no window work per hit. The corpse
+-- keeps the same worldObjNum, so the kill line only has to supply the name.
+function UnrealFX.armCombatWorldObj(worldId, slot)
     worldId = tonumber(worldId) or 0
     if worldId == 0 or worldId == UnrealFX.getPlayerWorldObjNum() then
         return false
     end
-    if UnrealFX.isFxDoneWorldId(worldId) then
+    slot = slot or hitRing.slotById[worldId]
+    if not slot or hitRing.ids[slot] ~= worldId then
         return false
     end
-    if type(AttachWindowToWorldObject) ~= "function" then
-        return false
-    end
-
-    local existing = UnrealFX.findFxInstanceByWorldId(worldId)
-    if existing then
-        if existing.phase == "armed" then
-            existing.t = 0
-            existing.armKey = UnrealFX.normalizeUnitName(name)
-            existing.armName = name
-            UnrealFX.rebindFxToWorldObject(existing.win, worldId)
-            UnrealFX.setFxAlpha(existing.win, existing.image or (existing.win .. "Image"), 0)
-            WindowSetShowing(existing.win, false)
-            return true
-        end
-        return true
-    end
-
-    local inst = UnrealFX.acquireFxInstance(worldId)
-    if not inst or not inst.win then
-        return false
-    end
-
-    local win = inst.win
-    local image = inst.image or (win .. "Image")
-    local prevId = tonumber(inst.attachedId) or 0
-    if prevId ~= 0 and prevId ~= worldId and type(DetachWindowFromWorldObject) == "function" then
-        pcall(DetachWindowFromWorldObject, win, prevId)
-        inst.attachedId = nil
-    end
-
-    UnrealFX.setFxAlpha(win, image, 0)
-    WindowSetShowing(win, false)
-    UnrealFX.rebindFxToWorldObject(win, worldId)
-
-    inst.attachedId = worldId
-    inst.key = nil
-    inst.phase = "armed"
-    inst.t = 0
-    inst.armKey = UnrealFX.normalizeUnitName(name)
-    inst.armName = name
-    inst.detachedForFade = nil
+    hitRing.armT[slot] = UnrealFX.fxClock or 0
     return true
 end
 
-function UnrealFX.addKillSpreeVictim(victimName)
+-- ability: normalized kill-line ability (RvR line), nil for PvE / unknown.
+function UnrealFX.addKillSpreeVictim(victimName, ability)
     if victimName == nil or victimName == L"" then
         return 0
     end
@@ -1083,77 +1589,115 @@ function UnrealFX.addKillSpreeVictim(victimName)
         UnrealFX.killSpreeVictims = list
     end
     local used = UnrealFX.collectUsedSpreeWorldIds()
-    local worldId = UnrealFX.resolveWorldObjForKill(victimName, used)
-    list[#list + 1] = {
+    local entry = {
         name = victimName,
-        worldId = worldId,
+        worldId = 0,
+        ability = ability,
+        killT = UnrealFX.fxClock or 0,
     }
-    return worldId
+    local reason
+    entry.worldId, reason = UnrealFX.resolveWorldObjForKill(victimName, used, entry)
+    if UnrealFX.probeEnabled then
+        UnrealFX.probeVictim("kill", victimName, entry.worldId, reason, entry.ability)
+    end
+    list[#list + 1] = entry
+    return entry.worldId
 end
 
-function UnrealFX.resetKillSpreeVictims(victimName)
+function UnrealFX.resetKillSpreeVictims(victimName, ability)
     UnrealFX.killSpreeVictims = {}
     UnrealFX.killSpreeFxWorldIds = {}
     if victimName ~= nil and victimName ~= L"" then
-        UnrealFX.addKillSpreeVictim(victimName)
+        UnrealFX.addKillSpreeVictim(victimName, ability)
     end
 end
 
-function UnrealFX.processPlayerKill(victimName, currenttime)
+-- A streak continues while each kill lands within this many seconds of the last.
+local KILL_SPREE_WINDOW_SECONDS = 5
+-- The same victim reported by both the RvR kill line and "You have slain X!"
+-- within this window is one kill.
+local KILL_DEDUPE_SECONDS = 2
+local NORMAL_KILL_KEYS = {
+    L"annihilation", L"erradication", L"extermination", L"godlike",
+    L"headshot", L"dominating", L"denied", L"wickedsick",
+}
+local MULTI_KILL_KEYS = {
+    L"bloodbath", L"holyshit", L"killingspree", L"ludicrous", L"megakill",
+    L"monsterkill1", L"monsterkill2", L"multikill", L"rampage", L"slaughter", L"unstoppable",
+}
+
+-- Small reused ring of recent kills: { key = normalized name, t = fxClock, source = "rvr"|"pve" }.
+local RECENT_KILL_CAP = 8
+local recentKills = {}
+local recentKillHead = 0
+
+-- True when the other kill path already reported this victim moments ago.
+-- Same-path repeats are real kills (e.g. several identically named mobs).
+local function isDuplicateKill(key, source, now)
+    for i = 1, RECENT_KILL_CAP do
+        local k = recentKills[i]
+        if k and k.source ~= source and k.key == key and (now - k.t) <= KILL_DEDUPE_SECONDS then
+            return true
+        end
+    end
+    return false
+end
+
+local function rememberKill(key, source, now)
+    recentKillHead = (recentKillHead % RECENT_KILL_CAP) + 1
+    local k = recentKills[recentKillHead]
+    if k == nil then
+        k = {}
+        recentKills[recentKillHead] = k
+    end
+    k.key = key
+    k.t = now
+    k.source = source
+end
+
+-- source: "rvr" (Combat RvR kill line) or "pve" (Chat "You have slain").
+-- ability: killing ability from the RvR line (any form), nil when unknown.
+function UnrealFX.processPlayerKill(victimName, source, ability)
     if victimName == nil or victimName == L"" then
         return
     end
 
-    local normalKillTable = {
-        L"annihilation", L"erradication", L"extermination", L"godlike",
-        L"headshot", L"dominating", L"denied", L"wickedsick",
-    }
-    local multiKillTable = {
-        L"bloodbath", L"holyshit", L"killingspree", L"ludicrous", L"megakill",
-        L"monsterkill1", L"monsterkill2", L"multikill", L"rampage", L"slaughter", L"unstoppable",
-    }
+    local now = UnrealFX.fxClock or 0
+    local key = UnrealFX.normalizeUnitName(victimName)
+    if isDuplicateKill(key, source, now) then
+        return
+    end
+    rememberKill(key, source, now)
+    local abilityKey = UnrealFX.normalizeAbilityKey(ability)
 
-    if KillSpree < 1 then
-        KillSpree = KillSpree + 1
-        FirstBloodTime = currenttime
-        UnrealFX.resetKillSpreeVictims(victimName)
-        UnrealFX.announcePlayerKill(L"firstblood", victimName)
+    if UnrealFX.killSpree < 1 then
+        UnrealFX.killSpree = 1
+        UnrealFX.lastKillClock = now
+        UnrealFX.resetKillSpreeVictims(victimName, abilityKey)
+        UnrealFX.announcePlayerKill(L"firstblood", victimName, abilityKey, now)
         return
     end
 
-    local hours, mins, secs = currenttime:match(L"([0-9]+):([0-9]+):([0-9]+)")
-    local fbhours, fbmins, fbsecs = FirstBloodTime:match(L"([0-9]+):([0-9]+):([0-9]+)")
-    local fbhoursinsec = tonumber(fbhours) * 3600
-    local fbminutesinsec = tonumber(fbmins) * 60
-    local fbsecsnum = tonumber(fbsecs) or 0
-    local fbtotalsec = fbhoursinsec + fbminutesinsec + fbsecsnum
-    local choursinsec = tonumber(hours) * 3600
-    local cminutesinsec = tonumber(mins) * 60
-    local secsnum = tonumber(secs) or 0
-    local ctotalinsec = choursinsec + cminutesinsec + secsnum
-    local diffsecs = ctotalinsec - fbtotalsec
+    local sinceLast = now - (UnrealFX.lastKillClock or 0)
+    UnrealFX.lastKillClock = now
 
-    if diffsecs < 5 then
-        KillSpree = KillSpree + 1
-        UnrealFX.addKillSpreeVictim(victimName)
-        FirstBloodTime = currenttime
-        if KillSpree == 2 then
+    if sinceLast >= 0 and sinceLast < KILL_SPREE_WINDOW_SECONDS then
+        UnrealFX.killSpree = UnrealFX.killSpree + 1
+        UnrealFX.addKillSpreeVictim(victimName, abilityKey)
+        if UnrealFX.killSpree == 2 then
             -- Sound once; FX on every distinct corpse in the streak.
-            UnrealFX.announcePlayerKill(L"doublekill", victimName)
+            UnrealFX.announcePlayerKill(L"doublekill", victimName, abilityKey, now)
             return
         end
-        if KillSpree > 2 then
-            local killType = multiKillTable[math.random(#multiKillTable)]
-            UnrealFX.announcePlayerKill(killType, victimName)
-            return
-        end
-    else
-        KillSpree = 1
-        FirstBloodTime = currenttime
-        UnrealFX.resetKillSpreeVictims(victimName)
-        local killType = normalKillTable[math.random(#normalKillTable)]
-        UnrealFX.announcePlayerKill(killType, victimName)
+        local killType = MULTI_KILL_KEYS[math.random(#MULTI_KILL_KEYS)]
+        UnrealFX.announcePlayerKill(killType, victimName, abilityKey, now)
+        return
     end
+
+    UnrealFX.killSpree = 1
+    UnrealFX.resetKillSpreeVictims(victimName, abilityKey)
+    local killType = NORMAL_KILL_KEYS[math.random(#NORMAL_KILL_KEYS)]
+    UnrealFX.announcePlayerKill(killType, victimName, abilityKey, now)
 end
 
 function UnrealFX.OnCombatHappened(updateType, filterType)
@@ -1176,22 +1720,40 @@ function UnrealFX.OnCombatHappened(updateType, filterType)
     end
 
     local num = TextLogGetNumEntries("Combat") - 1
-    local currenttime, _, msg = TextLogGetEntry("Combat", num)
-    local victim, killer = msg:match(L"([%a]+) has been [%a]+ by ([%a]+)'s [%a%d%p ]+ in [^%.]+.")
-
-    if victim == killer then
+    if num < 0 then
+        return
+    end
+    local _time, _filter, msg = TextLogGetEntry("Combat", num)
+    if msg == nil or msg == L"" then
+        return
+    end
+    -- "Victim has been slain by Killer's Ability in Zone." - keep the ability for pairing.
+    -- Killer may be a multi-word pet name.
+    local victim, killer, ability = msg:match(L"([%a]+) has been [%a]+ by (.-)'s (.-) in [^%.]+%.")
+    if victim == nil or killer == nil or victim == killer then
         return
     end
 
-    if victim == PlayerName then
+    local playerKey = UnrealFX.getPlayerNameKey()
+    local victimKey = UnrealFX.normalizeUnitName(victim)
+    local killerKey = UnrealFX.normalizeUnitName(killer)
+
+    if playerKey ~= L"" and victimKey == playerKey then
         if UnrealFX.getDefeatAlertsEnabled() then
             UnrealFX.announcePlayerDeath(killer)
         end
         return
     end
 
-    if killer == PlayerName then
-        UnrealFX.processPlayerKill(victim, currenttime)
+    if playerKey ~= L"" and killerKey == playerKey then
+        UnrealFX.processPlayerKill(victim, "rvr", ability)
+        return
+    end
+
+    if UnrealFX.isPlayerPetKey(killerKey)
+        and UnrealFX.hasRecentDamageChatFor(victimKey, UnrealFX.FX_PET_KILL_RECENT_HIT_SECONDS)
+    then
+        UnrealFX.processPlayerKill(victim, "rvr", ability)
     end
 end
 
@@ -1215,9 +1777,12 @@ function UnrealFX.OnChatKillHappened(updateType, filterType)
         return
     end
 
-    local currenttime, _, msg = TextLogGetEntry("Chat", num)
+    local _time, _filter, msg = TextLogGetEntry("Chat", num)
+    if msg == nil or msg == L"" then
+        return
+    end
     -- PVE kill confirm: "You have slain Training Construct!"
-    local victim = msg and msg:match(L"You have slain (.+)!")
+    local victim = msg:match(L"You have slain (.+)!")
     if victim == nil or victim == L"" then
         return
     end
@@ -1225,12 +1790,13 @@ function UnrealFX.OnChatKillHappened(updateType, filterType)
         return
     end
 
-    UnrealFX.processPlayerKill(victim, currenttime)
+    UnrealFX.processPlayerKill(victim, "pve")
 end
 
 function UnrealFX.logDeathBlow(killType)
+    -- Incremental saving (enabled in Initialize) appends the entry to
+    -- logs/UnrealFX.log; no full TextLogSaveLog per keyword.
     TextLogAddEntry(UnrealFX.logFileName, 0, towstring(killType))
-    TextLogSaveLog(UnrealFX.logFileName,towstring(""))
 end
 
 function UnrealFX.markKillSpreeFxShown(entry, worldId)
@@ -1255,7 +1821,9 @@ function UnrealFX.markKillSpreeFxShown(entry, worldId)
     end
 end
 
-function UnrealFX.announcePlayerKill(killType, victimName)
+-- ability / killT: the kill line's normalized ability and time, for the rare path
+-- with no kill-spree row (normally the row already carries both).
+function UnrealFX.announcePlayerKill(killType, victimName, ability, killT)
     -- One announcer sound per event. FX only on corpses not yet stamped this streak.
     UnrealFX.logDeathBlow(killType)
 
@@ -1297,7 +1865,7 @@ function UnrealFX.announcePlayerKill(killType, victimName)
         for i = 1, #victims do
             local entry = victims[i]
             if type(entry) == "table" and not entry.fxShown and (tonumber(entry.worldId) or 0) == 0 then
-                local worldId = UnrealFX.resolveWorldObjForKill(entry.name or victimName, used)
+                local worldId = UnrealFX.resolveWorldObjForKill(entry.name or victimName, used, entry)
                 entry.worldId = worldId
                 if worldId ~= 0 then
                     used[worldId] = true
@@ -1314,7 +1882,7 @@ function UnrealFX.announcePlayerKill(killType, victimName)
                 UnrealFX.markKillSpreeFxShown(entry, worldId)
             else
                 if worldId == 0 then
-                    worldId = UnrealFX.resolveWorldObjForKill(name, seenIds)
+                    worldId = UnrealFX.resolveWorldObjForKill(name, seenIds, entry)
                     entry.worldId = worldId
                 end
                 local shown = false
@@ -1324,13 +1892,19 @@ function UnrealFX.announcePlayerKill(killType, victimName)
                         label = UnrealFX.toNarrow(UnrealFX.normalizeUnitName(name)),
                     })
                 else
-                    -- Unknown victim after damage-pair / resolve -> self.
-                    shown = UnrealFX.showFxOnSelf(fxKey, { quiet = true })
-                    worldId = UnrealFX.getSelfWorldObjNum()
-                    entry.worldId = worldId
+                    -- Unknown victim: retry for 0.15-0.30 s in OnFxUpdate (corpse
+                    -- evidence, no hits after the kill) before any fallback.
+                    UnrealFX.queuePendingKillFx(fxKey, name, entry)
+                    return
                 end
                 if not shown then
-                    shown = UnrealFX.playKillFx(fxKey, name, { usedIds = seenIds })
+                    -- Same spree row: its ability / killT filter the re-resolve, and a
+                    -- pending retry marks this row when it shows.
+                    local how
+                    shown, how = UnrealFX.playKillFx(fxKey, name, { usedIds = seenIds, entry = entry })
+                    if how == "pending" then
+                        return
+                    end
                     worldId = tonumber(entry.worldId) or worldId
                 end
                 if shown then
@@ -1343,27 +1917,14 @@ function UnrealFX.announcePlayerKill(killType, victimName)
         end
     end
 
-    UnrealFX.playKillFx(fxKey, victimName)
+    UnrealFX.playKillFx(fxKey, victimName, { ability = ability, killT = killT })
 end
 
 function UnrealFX.announcePlayerDeath(killerName)
     -- Always defeat.wav; FX prefers killer world object, else pending scan / self.
     UnrealFX.logPlaybackKeyword("defeat")
-    if UnrealFX.playKillFx("defeat", killerName, { defeat = true }) then
-        return
-    end
-
-    -- No usable killer name: sticky hostile, else self world object.
-    local last = UnrealFX.lastHostile
-    local lastId = last and (tonumber(last.id) or 0) or 0
-    if lastId ~= 0 then
-        UnrealFX.showFxOnWorldObject("defeat", lastId, {
-            quiet = true,
-            label = UnrealFX.toNarrow(last.name or L""),
-        })
-        return
-    end
-    UnrealFX.showFxOnSelf("defeat", { quiet = true })
+    -- playKillFx resolves the killer, else queues a name scan that ends on hostile/self.
+    UnrealFX.playKillFx("defeat", killerName, { defeat = true })
 end
 
 function UnrealFX.getSelfWorldObjNum()
@@ -1388,7 +1949,6 @@ end
 -- Victim id unknown: current hostile target, else self.
 function UnrealFX.showFxOnHostileOrSelf(requestedKey, opts)
     opts = opts or {}
-    UnrealFX.captureHostileTarget()
     local hid = UnrealFX.getCurrentHostileWorldId()
     if hid ~= 0 then
         if not opts.label then
@@ -1517,12 +2077,20 @@ function UnrealFX.computeFxGrowScale(u)
     return peakS + (1.0 - peakS) * e
 end
 
-function UnrealFX.setFxAlpha(win, image, alpha)
+-- Pass the pool instance as `inst` to skip the client calls when its alpha is
+-- already at the requested value (e.g. the hold phase).
+function UnrealFX.setFxAlpha(win, image, alpha, inst)
     alpha = tonumber(alpha) or 0
     if alpha < 0 then
         alpha = 0
     elseif alpha > 1 then
         alpha = 1
+    end
+    if inst then
+        if inst.alpha == alpha then
+            return
+        end
+        inst.alpha = alpha
     end
     if win and DoesWindowExist(win) then
         WindowSetAlpha(win, alpha)
@@ -1603,16 +2171,14 @@ function UnrealFX.releaseFxInstance(inst)
         if attachedId ~= 0 and type(DetachWindowFromWorldObject) == "function" then
             pcall(DetachWindowFromWorldObject, win, attachedId)
         end
-        -- Detach again with 0-safe no-op if the client already dropped the bind on death.
-        if type(DetachWindowFromWorldObject) == "function" and attachedId ~= 0 then
-            pcall(DetachWindowFromWorldObject, win, attachedId)
-        end
         if type(WindowClearAnchors) == "function" then
             pcall(WindowClearAnchors, win)
         end
         UnrealFX.resetFxMotionVisuals(win)
         -- Alpha 0 (not 1): after death the client leaves the window Showing; alpha 1 = hang.
-        UnrealFX.setFxAlpha(win, image, 0)
+        -- Free-pool windows are hidden here once; nothing re-hides them per frame.
+        inst.alpha = nil
+        UnrealFX.setFxAlpha(win, image, 0, inst)
         WindowSetShowing(win, false)
     end
 
@@ -1625,19 +2191,20 @@ function UnrealFX.releaseFxInstance(inst)
     inst.spiralDir = nil
     inst.useMoveProject = nil
     inst.fellBackToSelf = nil
-    inst.armKey = nil
-    inst.armName = nil
-    inst.screenPinned = nil
-    inst.lastSX = nil
-    inst.lastSY = nil
-    inst.detachedForFade = nil
+    inst.noSelfFallback = nil
+    inst.projectTicks = nil
+    inst.stuckChecked = nil
+    inst.fixedAnchor = nil
+    inst.fixedReason = nil
+    inst.hasLastPos = nil
+    inst.lastX = nil
+    inst.lastY = nil
+    inst.missingTicks = nil
+    inst.offscreen = nil
+    inst.pinRetryAt = nil
+    inst.pinRetryGap = nil
     UnrealFX.fxFree = UnrealFX.fxFree or {}
     UnrealFX.fxFree[#UnrealFX.fxFree + 1] = inst
-end
-
--- Back-compat name used by older call sites / mental model.
-function UnrealFX.hideFxInstance(inst)
-    UnrealFX.releaseFxInstance(inst)
 end
 
 function UnrealFX.acquireFxInstance(worldId)
@@ -1660,28 +2227,14 @@ function UnrealFX.acquireFxInstance(worldId)
     if type(free) == "table" and #free > 0 then
         inst = table.remove(free)
     elseif #active > 0 then
-        -- Pool exhausted: recycle soft-armed first (not yet promoted), else oldest playing.
-        local oldestIdx = nil
-        local oldestT = -1
-        for i = 1, #active do
-            local a = active[i]
-            if a and a.phase == "armed" then
-                local t = a.t or 0
-                if t > oldestT then
-                    oldestT = t
-                    oldestIdx = i
-                end
-            end
-        end
-        if oldestIdx == nil then
-            oldestIdx = 1
-            oldestT = active[1] and (active[1].t or 0) or 0
-            for i = 2, #active do
-                local t = active[i] and (active[i].t or 0) or 0
-                if t > oldestT then
-                    oldestT = t
-                    oldestIdx = i
-                end
+        -- Pool exhausted: recycle the oldest playing instance.
+        local oldestIdx = 1
+        local oldestT = active[1] and (active[1].t or 0) or 0
+        for i = 2, #active do
+            local t = active[i] and (active[i].t or 0) or 0
+            if t > oldestT then
+                oldestT = t
+                oldestIdx = i
             end
         end
         inst = active[oldestIdx]
@@ -1727,41 +2280,61 @@ function UnrealFX.tickFxInstance(inst, elapsed)
     inst.t = (inst.t or 0) + (tonumber(elapsed) or 0)
     local t = inst.t
 
-    -- Soft-armed (hidden) bind from a combat hit - expire if no kill promotes it.
-    if inst.phase == "armed" then
-        -- Client forces Showing while attached; keep alpha 0 so it cannot "hang" opaque.
-        UnrealFX.setFxAlpha(win, image, 0)
-        local armDur = UnrealFX.FX_ARM_SECONDS or 5.0
-        if t >= armDur then
-            return false
-        end
-        return true
+    -- Playing FX: chat-bubble projection each tick (no Attach). With Move, a sentinel
+    -- offset is set before each Move and the drawn position is read once on the next
+    -- tick: a real position is remembered; a hidden window at the sentinel is
+    -- off-screen (keep following); a shown one counts as a miss. After
+    -- FX_MISSING_TICKS misses the FX is pinned (last position / event-text anchor /
+    -- screen center) instead of jumping to another target, and follows again once
+    -- the object is back (retryPinnedFx). Clients without the sentinel APIs keep a
+    -- one-time origin check.
+    local followId = tonumber(inst.attachedId) or 0
+    local sentinel = inst.useMoveProject and UnrealFX.canUseFxSentinel()
+    if followId ~= 0 and inst.fixedAnchor and sentinel then
+        UnrealFX.retryPinnedFx(inst, win, followId)
     end
-
-    -- Playing FX: chat-bubble projection each tick (no Attach). If the id parks at
-    -- screen origin / is off-screen, remount onto current hostile, else self.
-    if inst.useMoveProject then
-        local followId = tonumber(inst.attachedId) or 0
-        if followId ~= 0 then
-            UnrealFX.projectFxToWorldObject(win, followId)
-            if not inst.fellBackToSelf and UnrealFX.isFxWindowStuckAtOrigin(win) then
-                local fb = UnrealFX.fallbackFxProjectToHostileOrSelf(win, followId)
-                if fb ~= 0 then
-                    inst.attachedId = fb
-                    local selfId = UnrealFX.getSelfWorldObjNum()
-                    if selfId ~= 0 and fb == selfId then
-                        inst.fellBackToSelf = true
+    if followId ~= 0 and not inst.fixedAnchor then
+        local ticks = inst.projectTicks or 0
+        local watch = not inst.fellBackToSelf and not inst.noSelfFallback
+        if sentinel then
+            if ticks >= 1 and watch then
+                UnrealFX.sampleFxProjection(inst, win)
+                if (inst.missingTicks or 0) >= (UnrealFX.FX_MISSING_TICKS or 2) then
+                    inst.fixedReason = UnrealFX.anchorFxFixed(inst, win, followId)
+                    if UnrealFX.probeEnabled then
+                        UnrealFX.probeLine("pin id " .. followId .. " -> " .. tostring(inst.fixedReason))
                     end
                 end
             end
+            if not inst.fixedAnchor then
+                -- Self / unwatched FX are never sampled, so they get no sentinel.
+                if watch then
+                    local s = UnrealFX.FX_SENTINEL_OFFSET or -4096
+                    WindowSetOffsetFromParent(win, s, s)
+                end
+                UnrealFX.projectFxToWorldObject(win, followId)
+            end
+        else
+            if ticks >= 1 and watch and not inst.stuckChecked then
+                inst.stuckChecked = true
+                if UnrealFX.isFxWindowStuckAtOrigin(win) then
+                    inst.fixedReason = UnrealFX.anchorFxFixed(inst, win, followId)
+                    if UnrealFX.probeEnabled then
+                        UnrealFX.probeLine("pin(origin) id " .. followId .. " -> " .. tostring(inst.fixedReason))
+                    end
+                end
+            end
+            if inst.useMoveProject and not inst.fixedAnchor then
+                UnrealFX.projectFxToWorldObject(win, followId)
+            end
         end
+        inst.projectTicks = ticks + 1
     end
 
     local motion = inst.motion or "grow"
     -- Grow and spin share one intro length (spin only adds rotation).
     local growDur = UnrealFX.FX_GROW_SECONDS
         or UnrealFX.FX_SPIN_GROW_SECONDS
-        or UnrealFX.FX_ANIM_SECONDS
         or 0.45
     local shakeDur = UnrealFX.FX_SHAKE_SECONDS or 0.65
     local holdDur = UnrealFX.FX_HOLD_SECONDS or 0.25
@@ -1811,7 +2384,7 @@ function UnrealFX.tickFxInstance(inst, elapsed)
                 UnrealFX.setFxImageRotation(image, 0)
             end
         end
-        UnrealFX.setFxAlpha(win, image, 1.0)
+        UnrealFX.setFxAlpha(win, image, 1.0, inst)
         return true
     end
 
@@ -1847,7 +2420,7 @@ function UnrealFX.tickFxInstance(inst, elapsed)
                 WindowSetScale(image, scale)
             end
         end
-        UnrealFX.setFxAlpha(win, image, 1.0)
+        UnrealFX.setFxAlpha(win, image, 1.0, inst)
         return true
     end
 
@@ -1859,7 +2432,7 @@ function UnrealFX.tickFxInstance(inst, elapsed)
     -- 3) Brief still hold at configured scale.
     if t < holdEnd then
         inst.phase = "hold"
-        UnrealFX.setFxAlpha(win, image, 1.0)
+        UnrealFX.setFxAlpha(win, image, 1.0, inst)
         return true
     end
 
@@ -1871,7 +2444,7 @@ function UnrealFX.tickFxInstance(inst, elapsed)
     elseif fadeT > 1 then
         fadeT = 1
     end
-    UnrealFX.setFxAlpha(win, image, 1.0 - fadeT)
+    UnrealFX.setFxAlpha(win, image, 1.0 - fadeT, inst)
     return true
 end
 
@@ -1884,32 +2457,22 @@ function UnrealFX.OnFxUpdate(timePassed)
 
     UnrealFX.tickPendingFx(elapsed)
 
-    local active = UnrealFX.fxActive or {}
+    local active = UnrealFX.fxActive
+    if active == nil then
+        return
+    end
     local i = 1
     while i <= #active do
         local inst = active[i]
         if not UnrealFX.tickFxInstance(inst, elapsed) then
             local doneId = tonumber(inst and inst.attachedId) or 0
-            if doneId ~= 0 and inst.phase ~= "armed" then
+            if doneId ~= 0 then
                 UnrealFX.markFxDoneWorldId(doneId)
             end
             table.remove(active, i)
             UnrealFX.releaseFxInstance(inst)
         else
             i = i + 1
-        end
-    end
-
-    -- Belt-and-braces: free-pool windows must stay hidden (client attach can revive them).
-    local free = UnrealFX.fxFree
-    if type(free) == "table" then
-        for fi = 1, #free do
-            local inst = free[fi]
-            local win = inst and inst.win
-            if win and DoesWindowExist(win) then
-                UnrealFX.setFxAlpha(win, inst.image or (win .. "Image"), 0)
-                WindowSetShowing(win, false)
-            end
         end
     end
 end
@@ -2004,38 +2567,14 @@ function UnrealFX.rememberWorldObjName(worldObjNum, name)
         return
     end
     UnrealFX.worldObjByName[key] = id
-    UnrealFX.rememberRecentWorldObjId(id)
 end
 
-function UnrealFX.rememberRecentWorldObjId(worldObjNum)
-    local id = tonumber(worldObjNum) or 0
-    if id == 0 then
-        return
-    end
-    if id > (UnrealFX.nameScanMaxSeen or 0) then
-        UnrealFX.nameScanMaxSeen = id
-    end
-    local set = UnrealFX.recentWorldObjIdSet
-    local list = UnrealFX.recentWorldObjIds
-    if set[id] then
-        return
-    end
-    set[id] = true
-    list[#list + 1] = id
-    local maxN = UnrealFX.FX_RECENT_WORLD_OBJ_MAX or 96
-    while #list > maxN do
-        local old = table.remove(list, 1)
-        set[old] = nil
-    end
-end
-
-function UnrealFX.readTargetMeta(slot)
-    local meta = {
-        isPvP = false,
-        isNPC = nil,
-        career = 0,
-        unitType = nil,
-    }
+function UnrealFX.readTargetMeta(slot, meta)
+    meta = meta or {}
+    meta.isPvP = false
+    meta.isNPC = nil
+    meta.career = 0
+    meta.unitType = nil
     if not (TargetInfo and slot) then
         return meta
     end
@@ -2054,57 +2593,92 @@ function UnrealFX.readTargetMeta(slot)
     return meta
 end
 
-function UnrealFX.captureHostileTarget()
+-- HP% straight from the cached unit (UnitHealth returns 0 for a missing value).
+local function readSlotHp(slot)
+    local units = TargetInfo.m_Units
+    local unit = type(units) == "table" and units[slot] or nil
+    if type(unit) == "table" then
+        return tonumber(unit.healthPercent)
+    end
+    if type(TargetInfo.UnitHealth) == "function" then
+        return tonumber(TargetInfo:UnitHealth(slot))
+    end
+    return nil
+end
+
+local function fillTargetSnap(snap, slot, now)
+    local id = tonumber(TargetInfo:UnitEntityId(slot)) or 0
+    local name = L""
+    local hp = nil
+    if id ~= 0 then
+        name = TargetInfo:UnitName(slot) or L""
+        hp = readSlotHp(slot)
+    end
+    if snap.id ~= id or snap.name ~= name then
+        snap.key = UnrealFX.normalizeUnitName(name)
+    end
+    snap.id = id
+    snap.name = name
+    snap.hp = hp or -1
+    snap.t = now
+    if id ~= 0 and hp ~= nil and hp <= 0 and id ~= UnrealFX.getPlayerWorldObjNum() then
+        idRingSet(zeroHpRing, id, now)
+    end
+end
+
+-- Event-time half: optionally refresh TargetInfo (only from OnPlayerTargetUpdated),
+-- then copy hostile + mouseover into the reused snapshot tables.
+function UnrealFX.snapshotTargets(refresh)
     if not (TargetInfo and type(TargetInfo.UnitName) == "function" and type(TargetInfo.UnitEntityId) == "function") then
         return
     end
-
-    if type(TargetInfo.UpdateFromClient) == "function" then
-        pcall(function() TargetInfo:UpdateFromClient() end)
+    if refresh and type(TargetInfo.UpdateFromClient) == "function" then
+        pcall(TargetInfo.UpdateFromClient, TargetInfo)
     end
 
+    local now = UnrealFX.fxClock or 0
     local slot = TargetInfo.HOSTILE_TARGET or "selfhostiletarget"
-    local id = tonumber(TargetInfo:UnitEntityId(slot)) or 0
-    local name = TargetInfo:UnitName(slot)
-    -- Keep the previous hostile when the slot clears (common on player death).
-    if id == 0 or not name or name == L"" then
+    local hostile = UnrealFX.targetSnap.hostile
+    fillTargetSnap(hostile, slot, now)
+    fillTargetSnap(UnrealFX.targetSnap.mouseover, "mouseovertarget", now)
+
+    -- Sticky last hostile: keep the previous one when the slot clears (player death).
+    if hostile.id == 0 or hostile.name == L"" then
         return
     end
-
-    local meta = UnrealFX.readTargetMeta(slot)
-    UnrealFX.lastHostile = {
-        id = id,
-        name = UnrealFX.normalizeUnitName(name),
-        isPvP = meta.isPvP,
-        isNPC = meta.isNPC,
-        career = meta.career,
-        unitType = meta.unitType,
-    }
-    -- Do NOT feed target selection into recentNamedHits / worldObjByName - that made
+    local last = UnrealFX.lastHostile
+    if last.id ~= hostile.id or last.name ~= hostile.key then
+        last.id = hostile.id
+        last.name = hostile.key
+        UnrealFX.readTargetMeta(slot, last)
+    end
+    -- Do NOT feed target selection into the named-hit ring / worldObjByName - that made
     -- kill FX stick to a distant living target when AOE killed same-named mobs nearby.
 end
 
-function UnrealFX.OnPlayerTargetUpdated(targetClassification, targetId, targetType)
-    -- Always refresh from TargetInfo; targetId alone is unreliable on some ticks.
-    UnrealFX.captureHostileTarget()
+-- Read-only half: the last snapshot. Never refreshes TargetInfo.
+function UnrealFX.getHostileSnapshot()
+    return UnrealFX.targetSnap.hostile
 end
 
-function UnrealFX.OnWorldObjCombatEvent(hitTargetObjectNumber, hitAmount, textType)
-    -- Same as GroupIcons learning roster worldObjNums while alive: remember + soft-arm
-    -- the hit id. Corpses keep that worldObjNum; kill chat later matches by name.
-    local id = tonumber(hitTargetObjectNumber) or 0
-    if id == 0 or id == UnrealFX.getPlayerWorldObjNum() then
-        return
+function UnrealFX.getMouseoverSnapshot()
+    return UnrealFX.targetSnap.mouseover
+end
+
+function UnrealFX.OnPlayerTargetUpdated(targetClassification, targetId, targetType)
+    -- The only TargetInfo:UpdateFromClient caller; targetId alone is unreliable.
+    UnrealFX.snapshotTargets(true)
+end
+
+local COMBAT_HIT_META = { fromCombat = true }
+
+-- Cached name for a hit-ring slot; GetNameForObject at most once per id per second.
+local function combatHitName(slot, id, now)
+    local nameT = hitRing.nameT[slot]
+    if nameT and now - nameT < (UnrealFX.FX_NAME_LOOKUP_SECONDS or 1.0) then
+        return hitRing.name[slot] or nil, hitRing.key[slot] or nil
     end
-
-    UnrealFX.rememberRecentWorldObjId(id)
-
-    -- Outgoing damage (negative amount) for YOUR_HITS chat pairing on kill resolve.
-    local amount = tonumber(hitAmount) or 0
-    if amount < 0 then
-        UnrealFX.rememberRecentDamageEvent(id, -amount)
-    end
-
+    hitRing.nameT[slot] = now
     local name = nil
     if type(GetNameForObject) == "function" then
         local ok, n = pcall(GetNameForObject, id)
@@ -2112,30 +2686,72 @@ function UnrealFX.OnWorldObjCombatEvent(hitTargetObjectNumber, hitAmount, textTy
             name = n
         end
     end
-    -- Hostile/mouseover often has the name when GetNameForObject is empty on the hit tick.
-    if (name == nil or name == L"") and TargetInfo and type(TargetInfo.UnitEntityId) == "function" then
-        local slots = {
-            TargetInfo.HOSTILE_TARGET or "selfhostiletarget",
-            "mouseovertarget",
-        }
-        for i = 1, #slots do
-            local slot = slots[i]
-            if (tonumber(TargetInfo:UnitEntityId(slot)) or 0) == id then
-                local tn = TargetInfo:UnitName(slot)
-                if tn and tn ~= L"" then
-                    name = tn
-                    break
-                end
-            end
+    -- Hostile/mouseover snapshot often has the name when GetNameForObject is empty.
+    if name == nil then
+        local snap = UnrealFX.targetSnap.hostile
+        if snap.id ~= id then
+            snap = UnrealFX.targetSnap.mouseover
+        end
+        if snap.id == id and snap.name ~= L"" then
+            name = snap.name
         end
     end
+    if name == nil then
+        return hitRing.name[slot] or nil, hitRing.key[slot] or nil
+    end
+    if name ~= hitRing.name[slot] then
+        hitRing.name[slot] = name
+        local key = UnrealFX.normalizeUnitName(name)
+        hitRing.key[slot] = key ~= L"" and key or false
+    end
+    return name, hitRing.key[slot] or nil
+end
 
-    if name and name ~= L"" then
-        UnrealFX.rememberWorldObjName(id, name)
-        UnrealFX.rememberRecentNamedHit(id, name, { fromCombat = true })
+-- (hitTargetObjectNumber, hitAmount, textType[, abilityId]). Stock passes three
+-- arguments; a 4th numeric abilityId is used when the client provides one.
+function UnrealFX.OnWorldObjCombatEvent(...)
+    local hitTargetObjectNumber, hitAmount, textType, abilityArg = ...
+    if UnrealFX.probeEnabled then
+        UnrealFX.probeCombatEvent(select("#", ...), hitTargetObjectNumber, hitAmount, textType, abilityArg)
+    end
+    -- Data only: remember the hit id, damage amount and (throttled) name. The corpse
+    -- keeps this worldObjNum; the kill line later matches by name. No window work.
+    local id = tonumber(hitTargetObjectNumber) or 0
+    if id == 0 or id == UnrealFX.getPlayerWorldObjNum() then
+        return
     end
 
-    UnrealFX.armCombatWorldObj(id, name)
+    -- Heals (positive) never produce a kill victim: stop before recording anything,
+    -- so a healer's friendly targets do not churn the hit ring.
+    local amount = tonumber(hitAmount) or 0
+    if amount > 0 then
+        return
+    end
+
+    -- Outgoing damage (negative amount) for YOUR_HITS chat pairing on kill resolve.
+    local now = UnrealFX.fxClock or 0
+    local slot = touchCombatHit(id, now)
+    hitRing.dmgT[slot] = now
+    if amount < 0 then
+        local abilityKey = nil
+        if type(abilityArg) == "number" and abilityArg > 0 then
+            abilityKey = UnrealFX.getAbilityKeyById(abilityArg)
+        end
+        UnrealFX.rememberRecentDamageEvent(id, -amount, abilityKey)
+    end
+
+    local name, key = combatHitName(slot, id, now)
+    if key then
+        if UnrealFX.worldObjByName[key] ~= id then
+            UnrealFX.worldObjByName[key] = id
+        end
+        UnrealFX.rememberRecentNamedHit(id, name, COMBAT_HIT_META, key)
+    end
+
+    -- Only soft-arm on actual damage; misses/blocks (amount 0) just feed the caches.
+    if amount < 0 then
+        UnrealFX.armCombatWorldObj(id, slot)
+    end
 end
 
 function UnrealFX.probeWorldObjName(id, want)
@@ -2219,9 +2835,8 @@ function UnrealFX.scanWorldObjByName(want, budget, avoidId)
     -- Direct candidates: recent combat ids, name cache values, floating-combat trackers.
     local candidates = {}
     local seen = {}
-    local recent = UnrealFX.recentWorldObjIds or {}
-    for i = 1, #recent do
-        local id = recent[i]
+    for k = 1, hitRing.count do
+        local id = idRingAt(hitRing, k)
         if not seen[id] then
             seen[id] = true
             candidates[#candidates + 1] = id
@@ -2265,8 +2880,8 @@ function UnrealFX.scanWorldObjByName(want, budget, avoidId)
     if last then
         addSeed(last.id)
     end
-    for i = math.max(1, #recent - 11), #recent do
-        addSeed(recent[i])
+    for k = 1, math.min(12, hitRing.count) do
+        addSeed((idRingAt(hitRing, k)))
     end
 
     for s = 1, #seeds do
@@ -2303,10 +2918,6 @@ function UnrealFX.resolveWorldObjForVictim(victimName, opts)
         avoidId = UnrealFX.getLivingHostileWorldId()
     end
 
-    if not opts.skipCapture then
-        UnrealFX.captureHostileTarget()
-    end
-
     local function accept(id)
         id = tonumber(id) or 0
         if id == 0 then
@@ -2326,11 +2937,7 @@ function UnrealFX.resolveWorldObjForVictim(victimName, opts)
     if not opts.skipCurrentTarget
         and TargetInfo and type(TargetInfo.UnitName) == "function" and type(TargetInfo.UnitEntityId) == "function"
     then
-        local slots = {
-            TargetInfo.HOSTILE_TARGET or "selfhostiletarget",
-            "mouseovertarget",
-            TargetInfo.FRIENDLY_TARGET or "selffriendlytarget",
-        }
+        local slots = getVictimNameSlots()
         for i = 1, #slots do
             local slot = slots[i]
             local name = TargetInfo:UnitName(slot)
@@ -2423,8 +3030,6 @@ function UnrealFX.queuePendingFx(fxKey, unitName, opts)
             p.scanLo = scanLo
             p.scanHi = scanHi
             p.allowSelf = opts.allowSelf == true
-            p.killResolve = opts.killResolve == true
-            p.usedIds = opts.usedIds
             return
         end
     end
@@ -2443,9 +3048,114 @@ function UnrealFX.queuePendingFx(fxKey, unitName, opts)
         scanLo = scanLo,
         scanHi = scanHi,
         allowSelf = opts.allowSelf == true,
-        killResolve = opts.killResolve == true,
-        usedIds = opts.usedIds,
     }
+end
+
+local PENDING_RESOLVE_OPTS = { skipScan = true, skipCapture = true }
+local EMPTY_IDS = {}
+
+-- Pending kill FX: entry is the kill-spree row ({ name, worldId, ability, killT }).
+-- Not deduped by name: two same-named mobs can die together.
+function UnrealFX.queuePendingKillFx(fxKey, victimName, entry)
+    local want = UnrealFX.normalizeUnitName(victimName)
+    if not fxKey or want == L"" or type(entry) ~= "table" then
+        return false
+    end
+    UnrealFX.pendingFxQueue = UnrealFX.pendingFxQueue or {}
+    local queue = UnrealFX.pendingFxQueue
+    local maxN = UnrealFX.FX_MAX_INSTANCES or 8
+    while #queue >= maxN do
+        table.remove(queue, 1)
+    end
+    if entry.killT == nil then
+        entry.killT = UnrealFX.fxClock or 0
+    end
+    queue[#queue + 1] = {
+        kind = "kill",
+        fxKey = fxKey,
+        want = want,
+        name = victimName,
+        label = UnrealFX.toNarrow(want),
+        t = 0,
+        tries = 0,
+        entry = entry,
+    }
+    return true
+end
+
+-- Unresolved after the last try: never a living, different hostile.
+function UnrealFX.finishPendingKillFallback(pending)
+    local entry = pending.entry
+    local worldId, reason = UnrealFX.resolveFxDisplayFallbackWorldId(0, pending.want, entry.killT)
+    pending.reason = reason
+    if UnrealFX.probeEnabled then
+        UnrealFX.probeVictim("fallback", pending.name, worldId, reason, entry.ability)
+    end
+    local shown = false
+    if worldId ~= 0 then
+        shown = UnrealFX.showFxOnWorldObject(pending.fxKey, worldId, {
+            quiet = true,
+            label = pending.label,
+        })
+    end
+    if shown then
+        UnrealFX.markKillSpreeFxShown(entry, worldId)
+    end
+    return worldId, shown
+end
+
+-- One kill retry. Returns true when the pending entry is finished.
+function UnrealFX.tryPendingKill(pending)
+    local entry = pending.entry
+    if entry.fxShown then
+        return true
+    end
+    local used = UnrealFX.killSpreeFxWorldIds or EMPTY_IDS
+    local worldId = tonumber(entry.worldId) or 0
+    local reason = "spree"
+    if worldId ~= 0 and (used[worldId] or UnrealFX.wasHitAfterKill(worldId, entry.killT)) then
+        worldId = 0
+    end
+    if worldId == 0 then
+        worldId, reason = UnrealFX.resolveWorldObjForKill(pending.name, used, entry)
+    end
+    pending.reason = reason
+    if UnrealFX.probeEnabled then
+        UnrealFX.probeVictim("retry" .. tostring(pending.tries), pending.name, worldId, reason, entry.ability)
+    end
+    if worldId == 0 then
+        return false
+    end
+    entry.worldId = worldId
+    local shown = UnrealFX.showFxOnWorldObject(pending.fxKey, worldId, {
+        quiet = true,
+        label = pending.label,
+    })
+    if shown then
+        UnrealFX.markKillSpreeFxShown(entry, worldId)
+    end
+    return true
+end
+
+-- Returns true when the pending kill is finished (shown or fallen back).
+function UnrealFX.tickPendingKill(pending)
+    local t = pending.t
+    if pending.tries == 0 and t >= (UnrealFX.FX_KILL_RESOLVE_FIRST or 0.15) then
+        pending.tries = 1
+        if UnrealFX.tryPendingKill(pending) then
+            return true
+        end
+    end
+    if pending.tries == 1 and t >= (UnrealFX.FX_KILL_RESOLVE_LAST or 0.30) then
+        pending.tries = 2
+        if UnrealFX.tryPendingKill(pending) then
+            return true
+        end
+        pending.reason = "fallback"
+        UnrealFX.finishPendingKillFallback(pending)
+        return true
+    end
+    return false
 end
 
 function UnrealFX.tickPendingFx(elapsed)
@@ -2460,32 +3170,30 @@ function UnrealFX.tickPendingFx(elapsed)
         local pending = queue[i]
         pending.t = (pending.t or 0) + dt
 
-        local worldId = 0
-        if pending.killResolve then
-            -- Kill path: soft-arm / named hits / dead hostile (not the defeat name-scan).
-            worldId = UnrealFX.resolveWorldObjForKill(pending.want, pending.usedIds)
-        else
-            worldId = UnrealFX.resolveWorldObjForVictim(pending.want, {
-                skipScan = true,
-                skipCapture = true,
-            })
-            if worldId == 0 and type(GetNameForObject) == "function" then
-                local perFrame = UnrealFX.FX_PENDING_SCAN_PER_FRAME or 48
-                local id = pending.scanId or pending.scanLo or 1
-                local hi = pending.scanHi or id
-                for _ = 1, perFrame do
-                    if id > hi then
-                        break
-                    end
-                    local hit = UnrealFX.probeWorldObjName(id, pending.want)
-                    id = id + 1
-                    if hit ~= 0 then
-                        worldId = hit
-                        break
-                    end
-                end
-                pending.scanId = id
+        if pending.kind == "kill" then
+            if UnrealFX.tickPendingKill(pending) then
+                table.remove(queue, i)
+            else
+                i = i + 1
             end
+        else
+        local worldId = UnrealFX.resolveWorldObjForVictim(pending.want, PENDING_RESOLVE_OPTS)
+        if worldId == 0 and type(GetNameForObject) == "function" then
+            local perFrame = UnrealFX.FX_PENDING_SCAN_PER_FRAME or 48
+            local id = pending.scanId or pending.scanLo or 1
+            local hi = pending.scanHi or id
+            for _ = 1, perFrame do
+                if id > hi then
+                    break
+                end
+                local hit = UnrealFX.probeWorldObjName(id, pending.want)
+                id = id + 1
+                if hit ~= 0 then
+                    worldId = hit
+                    break
+                end
+            end
+            pending.scanId = id
         end
 
         if worldId ~= 0 then
@@ -2504,6 +3212,7 @@ function UnrealFX.tickPendingFx(elapsed)
             end
         else
             i = i + 1
+        end
         end
     end
 end
@@ -2535,11 +3244,6 @@ function UnrealFX.mapSoundKeywordToFxKey(keyword)
     return nil
 end
 
--- Back-compat alias.
-function UnrealFX.mapKillTypeToFxKey(killType)
-    return UnrealFX.mapSoundKeywordToFxKey(killType)
-end
-
 function UnrealFX.showFxOnWorldObject(requestedKey, worldId, opts)
     opts = opts or {}
     worldId = tonumber(worldId) or 0
@@ -2566,13 +3270,10 @@ function UnrealFX.showFxOnWorldObject(requestedKey, worldId, opts)
     end
 
     -- One FX window per world object (SCT-style). Concurrent kills keep separate overlays.
-    -- Soft-armed binds (phase "armed") are promoted; do not restart a playing kill FX.
+    -- Do not restart a playing kill FX.
     local existing = UnrealFX.findFxInstanceByWorldId(worldId)
     if existing and not opts.restart then
-        if existing.phase ~= "armed" then
-            return true
-        end
-        -- Promote armed -> visible kill FX below (same window, already world-bound).
+        return true
     end
 
     local inst = UnrealFX.acquireFxInstance(worldId)
@@ -2586,7 +3287,7 @@ function UnrealFX.showFxOnWorldObject(requestedKey, worldId, opts)
     local win = inst.win
     local image = inst.image or (win .. "Image")
     local prevId = tonumber(inst.attachedId) or 0
-    -- Drop soft-arm Attach so play uses bubble-style Move only (avoids Attach+Move fight).
+    -- Drop any old Attach so play uses bubble-style Move only (avoids Attach+Move fight).
     if type(DetachWindowFromWorldObject) == "function" then
         if prevId ~= 0 then
             pcall(DetachWindowFromWorldObject, win, prevId)
@@ -2616,50 +3317,28 @@ function UnrealFX.showFxOnWorldObject(requestedKey, worldId, opts)
         end
     end
     UnrealFX.resetFxMotionVisuals(win)
-    UnrealFX.setFxAlpha(win, image, 1.0)
+    inst.alpha = nil
+    UnrealFX.setFxAlpha(win, image, 1.0, inst)
 
     local useMove = type(MoveWindowToWorldObject) == "function"
     local attachId = worldId
+    local selfId = UnrealFX.getSelfWorldObjNum()
+    if inst.fixedAnchor and type(WindowClearAnchors) == "function" then
+        -- Restart on an instance that was pinned to Root: drop that anchor.
+        WindowClearAnchors(win)
+    end
+    WindowSetShowing(win, true)
+    local watched = opts.noSelfFallback ~= true and not (selfId ~= 0 and attachId == selfId)
+    if useMove and watched and UnrealFX.canUseFxSentinel() then
+        local s = UnrealFX.FX_SENTINEL_OFFSET or -4096
+        WindowSetOffsetFromParent(win, s, s)
+    end
     UnrealFX.projectFxToWorldObject(win, attachId)
     if type(ForceUpdateWorldObjectWindow) == "function" then
         pcall(ForceUpdateWorldObjectWindow, attachId, win)
     end
-
-    local selfId = UnrealFX.getSelfWorldObjNum()
-    local fellBack = false
-    if not opts.noSelfFallback
-        and attachId ~= selfId
-        and UnrealFX.isFxWindowStuckAtOrigin(win)
-    then
-        local fb = UnrealFX.fallbackFxProjectToHostileOrSelf(win, attachId)
-        if fb ~= 0 then
-            attachId = fb
-            fellBack = true
-            if opts.label == nil then
-                if selfId ~= 0 and fb == selfId then
-                    opts.label = "player"
-                else
-                    opts.label = "hostile"
-                end
-            end
-        end
-    end
-
-    WindowSetShowing(win, true)
-    UnrealFX.projectFxToWorldObject(win, attachId)
-    if type(ForceUpdateWorldObjectWindow) == "function" and attachId ~= 0 then
-        pcall(ForceUpdateWorldObjectWindow, attachId, win)
-    end
-    if not opts.noSelfFallback
-        and attachId ~= selfId
-        and UnrealFX.isFxWindowStuckAtOrigin(win)
-    then
-        local fb = UnrealFX.fallbackFxProjectToHostileOrSelf(win, attachId)
-        if fb ~= 0 then
-            attachId = fb
-            fellBack = true
-        end
-    end
+    -- The screen position only updates once the client has drawn the projection,
+    -- so the stuck-at-origin check (hostile / self fallback) runs in tickFxInstance.
 
     local motion = UnrealFX.pickFxMotion(opts)
     local spinStart = 0
@@ -2685,30 +3364,24 @@ function UnrealFX.showFxOnWorldObject(requestedKey, worldId, opts)
     inst.useMoveProject = useMove
     inst.phase = "grow"
     inst.t = 0
-    inst.armKey = nil
-    inst.armName = nil
-    inst.screenPinned = nil
-    inst.lastSX = nil
-    inst.lastSY = nil
-    inst.detachedForFade = nil
-    inst.fellBackToSelf = fellBack or (selfId ~= 0 and attachId == selfId)
+    inst.noSelfFallback = opts.noSelfFallback == true
+    inst.projectTicks = 0
+    inst.stuckChecked = false
+    inst.fixedAnchor = false
+    inst.fixedReason = nil
+    inst.hasLastPos = false
+    inst.missingTicks = 0
+    inst.offscreen = false
+    inst.pinRetryAt = nil
+    inst.pinRetryGap = nil
+    inst.fellBackToSelf = selfId ~= 0 and attachId == selfId
     -- Block re-arm / re-FX on the intended corpse even if we displayed on self.
     UnrealFX.markFxDoneWorldId(worldId)
-    if attachId ~= worldId then
-        UnrealFX.markFxDoneWorldId(attachId)
-    end
     UnrealFX.consumeCombatHitWorldId(worldId)
     UnrealFX.fxLastKey = entry.key
 
     if not opts.quiet then
         local who = opts.label or ("worldObj " .. tostring(attachId))
-        if fellBack then
-            if selfId ~= 0 and attachId == selfId then
-                who = who .. " (self fallback)"
-            else
-                who = who .. " (hostile fallback)"
-            end
-        end
         local soundNote = ""
         if opts.sound and opts.sound ~= "" then
             soundNote = " + sound '" .. tostring(opts.sound) .. "'"
@@ -2729,6 +3402,9 @@ function UnrealFX.showFxOnWorldObject(requestedKey, worldId, opts)
     return true
 end
 
+-- opts.entry: the kill-spree row ({ name, worldId, ability, killT }); without one a
+-- row is built from opts.ability / opts.killT. Returns shown[, "pending"]: "pending"
+-- means a 0.15-0.30 s retry tied to that row was queued and will mark it.
 function UnrealFX.playKillFx(killType, victimName, opts)
     -- Visual only. Sound is logged once by announcePlayerKill / logPlaybackKeyword.
     opts = opts or {}
@@ -2736,31 +3412,43 @@ function UnrealFX.playKillFx(killType, victimName, opts)
     if not fxKey then
         return false
     end
-
-    local worldId = 0
-    if opts.defeat then
-        worldId = UnrealFX.resolveWorldObjForVictim(victimName)
-    else
-        -- Combat soft-arm / dead hostile / lastHostile - never a living hostile.
-        worldId = UnrealFX.resolveWorldObjForKill(victimName, opts.usedIds)
-    end
-    if worldId ~= 0 then
-        return UnrealFX.showFxOnWorldObject(fxKey, worldId, {
-            quiet = true,
-            label = UnrealFX.toNarrow(UnrealFX.normalizeUnitName(victimName)),
-        })
-    end
+    local label = UnrealFX.toNarrow(UnrealFX.normalizeUnitName(victimName))
 
     if opts.defeat then
+        local worldId = UnrealFX.resolveWorldObjForVictim(victimName)
+        if worldId ~= 0 then
+            return UnrealFX.showFxOnWorldObject(fxKey, worldId, { quiet = true, label = label })
+        end
         UnrealFX.queuePendingFx(fxKey, victimName, { allowSelf = true })
         return true
     end
 
-    -- Unknown victim world object -> self.
-    return UnrealFX.showFxOnSelf(fxKey, {
-        quiet = true,
-        label = UnrealFX.toNarrow(UnrealFX.normalizeUnitName(victimName)),
-    })
+    local entry = opts.entry
+    if type(entry) ~= "table" then
+        entry = {
+            name = victimName,
+            worldId = 0,
+            ability = opts.ability,
+            killT = tonumber(opts.killT) or UnrealFX.fxClock or 0,
+        }
+    end
+    -- Combat pairs / evidence / soft-arm, filtered by ability and hits after killT -
+    -- never a living hostile.
+    local worldId = UnrealFX.resolveWorldObjForKill(victimName, opts.usedIds, entry)
+    if worldId ~= 0 then
+        entry.worldId = worldId
+        local shown = UnrealFX.showFxOnWorldObject(fxKey, worldId, { quiet = true, label = label })
+        if shown then
+            UnrealFX.markKillSpreeFxShown(entry, worldId)
+        end
+        return shown
+    end
+
+    -- Unknown victim world object -> short pending resolve, then fallback.
+    if UnrealFX.queuePendingKillFx(fxKey, victimName, entry) then
+        return true, "pending"
+    end
+    return false
 end
 
 function UnrealFX.playSoundFx(keyword, worldId)
@@ -3118,13 +3806,15 @@ function UnrealFX.TryHookDialogManager()
 end
 
 function UnrealFX.OnModulesInitialized()
+    UnrealFX.RegisterSlashCommands()
+    UnrealFX.printLoginLine()
     UnrealFX.TryHookDialogManager()
     UnrealFX.TryRegisterReadyCheckPacket()
     -- Career/level data is reliably populated by now; re-evaluate in case
     -- Initialize ran before saved settings or player data were restored.
     UnrealFX.updatePullAlertWatch()
     -- Target slot is valid after modules init; Initialize often ran too early for lastHostile.
-    UnrealFX.captureHostileTarget()
+    UnrealFX.snapshotTargets(false)
     UnrealFX.ensureFxPool()
 end
 
@@ -3248,6 +3938,75 @@ end
 
 function UnrealFX.getHelpCommandPrefix()
     return UnrealFX.makeColorLink("/ufx", UnrealFX.helpCommandColor)
+end
+
+-- Diagnostics (/ufx probe). Off by default; all output is ASCII.
+UnrealFX.probeEnabled = false
+UnrealFX.FX_PROBE_COMBAT_SECONDS = 2.0
+local probeCombatNextT = 0
+
+function UnrealFX.probeText(value)
+    if value == nil then
+        return "nil"
+    end
+    local s = UnrealFX.toNarrow(value)
+    s = string.gsub(s, "[^\32-\126]", "?")
+    return s
+end
+
+function UnrealFX.probeLine(text)
+    UnrealFX.chatPrint("[probe] " .. UnrealFX.probeText(text))
+end
+
+-- WORLD_OBJ_COMBAT_EVENT: argument count and the 4th argument, at most every 2 s.
+function UnrealFX.probeCombatEvent(argc, id, amount, textType, arg4)
+    local now = UnrealFX.fxClock or 0
+    if now < probeCombatNextT then
+        return
+    end
+    probeCombatNextT = now + (UnrealFX.FX_PROBE_COMBAT_SECONDS or 2.0)
+    local line = "combat argc=" .. tostring(argc)
+        .. " id=" .. tostring(id)
+        .. " amt=" .. tostring(amount)
+        .. " type=" .. tostring(textType)
+        .. " arg4=" .. type(arg4) .. ":" .. UnrealFX.probeText(tostring(arg4))
+    if type(arg4) == "number" and arg4 > 0 then
+        line = line .. " ability=" .. tostring(UnrealFX.getAbilityKeyById(arg4))
+    end
+    UnrealFX.probeLine(line)
+end
+
+-- XP / renown event id vs the player's id, and the name for that id.
+function UnrealFX.probeReward(kind, id, points)
+    local name = ""
+    if id ~= 0 and type(GetNameForObject) == "function" then
+        local ok, n = pcall(GetNameForObject, id)
+        if ok and n then
+            name = n
+        end
+    end
+    UnrealFX.probeLine(tostring(kind) .. " id=" .. tostring(id)
+        .. " player=" .. tostring(UnrealFX.getPlayerWorldObjNum())
+        .. " pts=" .. tostring(points)
+        .. " name=" .. UnrealFX.probeText(name))
+end
+
+function UnrealFX.probeVictim(stage, victimName, worldId, reason, ability)
+    UnrealFX.probeLine("victim " .. tostring(stage)
+        .. " name=" .. UnrealFX.probeText(victimName)
+        .. " id=" .. tostring(worldId)
+        .. " why=" .. tostring(reason)
+        .. " ability=" .. UnrealFX.probeText(ability or "?"))
+end
+
+function UnrealFX.toggleProbe()
+    UnrealFX.probeEnabled = not UnrealFX.probeEnabled
+    probeCombatNextT = 0
+    if UnrealFX.probeEnabled then
+        UnrealFX.chatPrint("Probe on: printing combat-event args, XP/renown ids and kill victim picks. /ufx probe to stop.")
+    else
+        UnrealFX.chatPrint("Probe off.")
+    end
 end
 
 function UnrealFX.chatPrint(message)
@@ -3554,7 +4313,7 @@ function UnrealFX.printAlertSettings()
 end
 
 function UnrealFX.printStatus()
-    UnrealFX.chatPrint("Version: " .. (UnrealFX.VERSION or "?"))
+    UnrealFX.chatPrint("Version: " .. UnrealFX.getVersion())
     UnrealFX.printAlertSettings()
 end
 
@@ -3706,6 +4465,7 @@ function UnrealFX.printSlashUsage()
     UnrealFX.chatPrint(cmd .. " fx [show|hide|list|scale <n>|<name>] -- FX overlay + matching sound on your player")
     UnrealFX.chatPrint(cmd .. " list -- list known keywords and aliases")
     UnrealFX.chatPrint(cmd .. " alerts [readycheck|scenario|fortress|lotd|defeat|pve|embrace|fetch] [on|off|toggle] -- show or change alert toggles")
+    UnrealFX.chatPrint(cmd .. " probe -- toggle kill-placement diagnostics in chat")
 end
 
 function UnrealFX.printSlashKeywords()
@@ -3763,16 +4523,9 @@ end
 function UnrealFX.playKeyword(keyword)
     local resolved = UnrealFX.logPlaybackKeyword(keyword)
     -- Prefer attaching to current hostile target when testing a kill FX sound.
-    local worldId = 0
-    if TargetInfo and type(TargetInfo.UnitEntityId) == "function" then
-        if type(TargetInfo.UpdateFromClient) == "function" then
-            pcall(function() TargetInfo:UpdateFromClient() end)
-        end
-        local slot = TargetInfo.HOSTILE_TARGET
-        worldId = tonumber(TargetInfo:UnitEntityId(slot)) or 0
-        if worldId == 0 then
-            worldId = tonumber(TargetInfo:UnitEntityId("mouseovertarget")) or 0
-        end
+    local worldId = UnrealFX.targetSnap.hostile.id
+    if worldId == 0 then
+        worldId = UnrealFX.targetSnap.mouseover.id
     end
     UnrealFX.playSoundFx(resolved, worldId)
     UnrealFX.chatPrint("Triggered alert: " .. resolved)
@@ -3826,6 +4579,11 @@ function UnrealFX.OnSlashCommand(input)
         return
     end
 
+    if action == "probe" then
+        UnrealFX.toggleProbe()
+        return
+    end
+
     if action == "play" or action == "trigger" or action == "test" then
         UnrealFX.handlePlayCommand(rest)
         return
@@ -3845,27 +4603,19 @@ function UnrealFX.OnSlashCommand(input)
     UnrealFX.chatPrint("Unknown command or keyword. Use /ufx help or /ufx list.")
 end
 
--- Registers slash commands when LibSlash is available.
+-- Registers /ufx and /unrealfx when LibSlash is available. Safe to call again:
+-- Initialize tries first, OnModulesInitialized retries once every addon (and so
+-- LibSlash, an optional dependency) has loaded. Returns true once registered.
 function UnrealFX.RegisterSlashCommands()
-    if LibSlash and LibSlash.RegisterSlashCmd then
-        local registered = {}
-        local okShort = pcall(LibSlash.RegisterSlashCmd, "ufx", UnrealFX.OnSlashCommand)
-        if okShort then
-            registered[#registered + 1] = "/ufx"
-        end
-
-        local okLong = pcall(LibSlash.RegisterSlashCmd, "unrealfx", UnrealFX.OnSlashCommand)
-        if okLong then
-            registered[#registered + 1] = "/unrealfx"
-        end
-
-        if #registered > 0 then
-            UnrealFX.chatPrint("LibSlash detected; commands: " .. table.concat(registered, ", ") .. ".")
-        else
-            UnrealFX.chatPrint(L"LibSlash detected but slash commands could not be registered.")
-        end
-        return
+    if UnrealFX._slashRegistered then
+        return true
+    end
+    if not (LibSlash and type(LibSlash.RegisterSlashCmd) == "function") then
+        return false
     end
 
-    UnrealFX.chatPrint(L"LibSlash not found; slash commands unavailable.")
+    local okShort = pcall(LibSlash.RegisterSlashCmd, "ufx", UnrealFX.OnSlashCommand)
+    local okLong = pcall(LibSlash.RegisterSlashCmd, "unrealfx", UnrealFX.OnSlashCommand)
+    UnrealFX._slashRegistered = (okShort or okLong) and true or false
+    return UnrealFX._slashRegistered
 end
