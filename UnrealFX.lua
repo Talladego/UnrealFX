@@ -766,8 +766,9 @@ function UnrealFX.killEvidenceBonus(id, now)
 end
 
 -- Kill victim id still unknown after the pending retries. The hostile target is
--- used only when it is the victim (name match, not hit after killT) or at 0% HP;
--- a living, different hostile is never used. Else self (last resort).
+-- used only when it is at 0% HP, or is the victim: name match, not hit after killT,
+-- and no target update since killT (a fresh update without 0% HP means a living
+-- same-named unit). A living, different hostile is never used. Else self (last resort).
 function UnrealFX.resolveFxDisplayFallbackWorldId(excludeId, wantKey, killT)
     excludeId = tonumber(excludeId) or 0
     local snap = UnrealFX.targetSnap.hostile
@@ -777,7 +778,9 @@ function UnrealFX.resolveFxDisplayFallbackWorldId(excludeId, wantKey, killT)
         local zt = UnrealFX.getZeroHpTime(hid)
         local atZero = (snap.hp ~= nil and snap.hp >= 0 and snap.hp <= 0)
             or (zt ~= nil and (now - zt) <= (UnrealFX.FX_KILL_EVIDENCE_SECONDS or 3.0))
-        local isVictim = wantKey ~= nil and wantKey ~= L"" and snap.key == wantKey
+        killT = tonumber(killT)
+        local isVictim = not atZero and killT ~= nil and wantKey ~= nil and wantKey ~= L""
+            and snap.key == wantKey and (tonumber(snap.t) or 0) <= killT
             and not UnrealFX.wasHitAfterKill(hid, killT)
         if atZero or isVictim then
             return hid, atZero and "target-0hp" or "target-victim"
