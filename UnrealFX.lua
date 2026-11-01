@@ -52,23 +52,61 @@ UnrealFX.fxLastKey = nil
 UnrealFX.worldObjByName = UnrealFX.worldObjByName or {}
 -- Sticky hostile: target often clears on death before the kill chat line arrives.
 UnrealFX.lastHostile = UnrealFX.lastHostile or { id = 0, name = L"" }
+-- Target snapshots. Only OnPlayerTargetUpdated refreshes TargetInfo (UpdateFromClient);
+-- everything else reads these reused tables. hp = -1 when unknown.
+UnrealFX.targetSnap = UnrealFX.targetSnap or {
+    hostile = { id = 0, key = L"", name = L"", hp = -1, t = 0 },
+    mouseover = { id = 0, key = L"", name = L"", hp = -1, t = 0 },
+}
 -- Recent hit-target entity ids (WORLD_OBJ_COMBAT_EVENT). Used as scan seeds.
 UnrealFX.recentWorldObjIds = UnrealFX.recentWorldObjIds or {}
 UnrealFX.recentWorldObjIdSet = UnrealFX.recentWorldObjIdSet or {}
 UnrealFX.FX_RECENT_WORLD_OBJ_MAX = 96
 
--- Target slot lists, built once on first use (TargetInfo may load after this file).
-local hitNameSlots = nil
-local victimNameSlots = nil
-local function getHitNameSlots()
-    if hitNameSlots == nil then
-        hitNameSlots = {
-            (TargetInfo and TargetInfo.HOSTILE_TARGET) or "selfhostiletarget",
-            "mouseovertarget",
-        }
-    end
-    return hitNameSlots
+-- Fixed-size id -> time rings: parallel arrays, no per-entry tables. Setting a known
+-- id updates it in place; a new id overwrites the oldest slot.
+local function newIdTimeRing(cap)
+    return { cap = cap, head = 0, count = 0, ids = {}, times = {}, slotById = {} }
 end
+local function idRingSet(ring, id, t)
+    local slot = ring.slotById[id]
+    if slot then
+        ring.times[slot] = t
+        return slot
+    end
+    local head = (ring.head % ring.cap) + 1
+    ring.head = head
+    local old = ring.ids[head]
+    if old and ring.slotById[old] == head then
+        ring.slotById[old] = nil
+    end
+    ring.ids[head] = id
+    ring.times[head] = t
+    ring.slotById[id] = head
+    if ring.count < ring.cap then
+        ring.count = ring.count + 1
+    end
+    return head
+end
+local function idRingGet(ring, id)
+    local slot = ring.slotById[id]
+    if slot then
+        return ring.times[slot]
+    end
+    return nil
+end
+-- k = 1 is the newest insert. Returns id, time.
+local function idRingAt(ring, k)
+    local slot = ((ring.head - k) % ring.cap) + 1
+    return ring.ids[slot], ring.times[slot]
+end
+UnrealFX._idRing = { new = newIdTimeRing, set = idRingSet, get = idRingGet, at = idRingAt }
+-- Per-id time a target slot reported 0% HP (from PLAYER_TARGET_UPDATED snapshots).
+local zeroHpRing = newIdTimeRing(32)
+UnrealFX.zeroHpRing = zeroHpRing
+
+-- Target slot lists, built once on first use (TargetInfo may load after this file).
+local victimNameSlots = nil
 local function getVictimNameSlots()
     if victimNameSlots == nil then
         victimNameSlots = {
@@ -345,7 +383,8 @@ function UnrealFX.Initialize()
         UnrealFX.printLoginLine()
     end
     UnrealFX.updatePullAlertWatch()
-    UnrealFX.captureHostileTarget()
+    -- Seed snapshots from TargetInfo's cached slots (no client refresh here).
+    UnrealFX.snapshotTargets(false)
 end
 
 -- One chat line per login. Printed from Initialize when /ufx is ready, otherwise
@@ -512,38 +551,25 @@ function UnrealFX.getPlayerWorldObjNum()
     return 0
 end
 
--- Current hostile entity id (any HP). Used when victim world id is unknown.
+-- Current hostile entity id (any HP) from the last PLAYER_TARGET_UPDATED snapshot.
 function UnrealFX.getCurrentHostileWorldId()
-    if not (TargetInfo and type(TargetInfo.UnitEntityId) == "function") then
-        return 0
-    end
-    if type(TargetInfo.UpdateFromClient) == "function" then
-        pcall(function() TargetInfo:UpdateFromClient() end)
-    end
-    local slot = TargetInfo.HOSTILE_TARGET or "selfhostiletarget"
-    return tonumber(TargetInfo:UnitEntityId(slot)) or 0
+    return UnrealFX.targetSnap.hostile.id or 0
 end
 
 -- Living current hostile (HP > 0). resolveWorldObjForKill prefers other candidates
 -- so AOE same-name kills are not stamped onto a still-living target.
 function UnrealFX.getLivingHostileWorldId()
-    local id = UnrealFX.getCurrentHostileWorldId()
-    if id == 0 then
-        return 0
-    end
-    if not (TargetInfo and type(TargetInfo.UnitHealth) == "function") then
-        return 0
-    end
-    local slot = TargetInfo.HOSTILE_TARGET or "selfhostiletarget"
-    local hp = tonumber(TargetInfo:UnitHealth(slot))
-    if hp == nil or hp > 0 then
-        -- Missing HP: do not treat as living-avoid (targeted kill path needs the id).
-        if hp == nil then
-            return 0
-        end
-        return id
+    local snap = UnrealFX.targetSnap.hostile
+    -- Unknown HP (-1): do not treat as living-avoid (targeted kill path needs the id).
+    if snap.id ~= 0 and snap.hp > 0 then
+        return snap.id
     end
     return 0
+end
+
+-- Time the id was last seen at 0% HP in a target slot, or nil.
+function UnrealFX.getZeroHpTime(id)
+    return idRingGet(zeroHpRing, tonumber(id) or 0)
 end
 
 -- When the kill victim id is unknown / projection fails: current hostile, else self.
@@ -991,8 +1017,6 @@ function UnrealFX.resolveWorldObjForKill(victimName, usedIds)
         return 0
     end
     usedIds = usedIds or {}
-    -- Refresh after /reload: PLAYER_TARGET_UPDATED may not have fired yet.
-    UnrealFX.captureHostileTarget()
     local avoidId = UnrealFX.getLivingHostileWorldId()
     local combatIds = UnrealFX.collectCombatHitWorldObjsNewestFirst()
 
@@ -1076,16 +1100,13 @@ function UnrealFX.resolveWorldObjForKill(victimName, usedIds)
         return probeAvoidMatch
     end
 
-    -- 4) Dead / cleared hostile matching the kill name (targeted kill).
-    if TargetInfo and type(TargetInfo.UnitEntityId) == "function" then
-        if type(TargetInfo.UpdateFromClient) == "function" then
-            pcall(function() TargetInfo:UpdateFromClient() end)
-        end
-        local slot = TargetInfo.HOSTILE_TARGET or "selfhostiletarget"
-        local tid = tonumber(TargetInfo:UnitEntityId(slot)) or 0
-        local tname = TargetInfo:UnitName(slot)
-        if tid ~= 0 and UnrealFX.namesEqual(tname, want) then
-            local hp = type(TargetInfo.UnitHealth) == "function" and tonumber(TargetInfo:UnitHealth(slot)) or nil
+    -- 4) Dead / cleared hostile matching the kill name (targeted kill), from the snapshot.
+    do
+        local snap = UnrealFX.targetSnap.hostile
+        local tid = snap.id
+        local tname = snap.name
+        if tid ~= 0 and snap.key == want then
+            local hp = snap.hp >= 0 and snap.hp or nil
             -- HP <= 0: corpse still targeted. HP > 0: kill line often races the HP update;
             -- only accept when combat evidence already pointed at this same id (steps 1-3
             -- would have returned it via allowAvoid - reaching here means no soft-arm/hit,
@@ -1506,7 +1527,6 @@ end
 -- Victim id unknown: current hostile target, else self.
 function UnrealFX.showFxOnHostileOrSelf(requestedKey, opts)
     opts = opts or {}
-    UnrealFX.captureHostileTarget()
     local hid = UnrealFX.getCurrentHostileWorldId()
     if hid ~= 0 then
         if not opts.label then
@@ -2151,13 +2171,12 @@ function UnrealFX.rememberRecentWorldObjId(worldObjNum)
     end
 end
 
-function UnrealFX.readTargetMeta(slot)
-    local meta = {
-        isPvP = false,
-        isNPC = nil,
-        career = 0,
-        unitType = nil,
-    }
+function UnrealFX.readTargetMeta(slot, meta)
+    meta = meta or {}
+    meta.isPvP = false
+    meta.isNPC = nil
+    meta.career = 0
+    meta.unitType = nil
     if not (TargetInfo and slot) then
         return meta
     end
@@ -2176,39 +2195,81 @@ function UnrealFX.readTargetMeta(slot)
     return meta
 end
 
-function UnrealFX.captureHostileTarget()
+-- HP% straight from the cached unit (UnitHealth returns 0 for a missing value).
+local function readSlotHp(slot)
+    local units = TargetInfo.m_Units
+    local unit = type(units) == "table" and units[slot] or nil
+    if type(unit) == "table" then
+        return tonumber(unit.healthPercent)
+    end
+    if type(TargetInfo.UnitHealth) == "function" then
+        return tonumber(TargetInfo:UnitHealth(slot))
+    end
+    return nil
+end
+
+local function fillTargetSnap(snap, slot, now)
+    local id = tonumber(TargetInfo:UnitEntityId(slot)) or 0
+    local name = L""
+    local hp = nil
+    if id ~= 0 then
+        name = TargetInfo:UnitName(slot) or L""
+        hp = readSlotHp(slot)
+    end
+    if snap.id ~= id or snap.name ~= name then
+        snap.key = UnrealFX.normalizeUnitName(name)
+    end
+    snap.id = id
+    snap.name = name
+    snap.hp = hp or -1
+    snap.t = now
+    if id ~= 0 and hp ~= nil and hp <= 0 and id ~= UnrealFX.getPlayerWorldObjNum() then
+        idRingSet(zeroHpRing, id, now)
+    end
+end
+
+-- Event-time half: optionally refresh TargetInfo (only from OnPlayerTargetUpdated),
+-- then copy hostile + mouseover into the reused snapshot tables.
+function UnrealFX.snapshotTargets(refresh)
     if not (TargetInfo and type(TargetInfo.UnitName) == "function" and type(TargetInfo.UnitEntityId) == "function") then
         return
     end
-
-    if type(TargetInfo.UpdateFromClient) == "function" then
-        pcall(function() TargetInfo:UpdateFromClient() end)
+    if refresh and type(TargetInfo.UpdateFromClient) == "function" then
+        pcall(TargetInfo.UpdateFromClient, TargetInfo)
     end
 
+    local now = UnrealFX.fxClock or 0
     local slot = TargetInfo.HOSTILE_TARGET or "selfhostiletarget"
-    local id = tonumber(TargetInfo:UnitEntityId(slot)) or 0
-    local name = TargetInfo:UnitName(slot)
-    -- Keep the previous hostile when the slot clears (common on player death).
-    if id == 0 or not name or name == L"" then
+    local hostile = UnrealFX.targetSnap.hostile
+    fillTargetSnap(hostile, slot, now)
+    fillTargetSnap(UnrealFX.targetSnap.mouseover, "mouseovertarget", now)
+
+    -- Sticky last hostile: keep the previous one when the slot clears (player death).
+    if hostile.id == 0 or hostile.name == L"" then
         return
     end
-
-    local meta = UnrealFX.readTargetMeta(slot)
-    UnrealFX.lastHostile = {
-        id = id,
-        name = UnrealFX.normalizeUnitName(name),
-        isPvP = meta.isPvP,
-        isNPC = meta.isNPC,
-        career = meta.career,
-        unitType = meta.unitType,
-    }
+    local last = UnrealFX.lastHostile
+    if last.id ~= hostile.id or last.name ~= hostile.key then
+        last.id = hostile.id
+        last.name = hostile.key
+        UnrealFX.readTargetMeta(slot, last)
+    end
     -- Do NOT feed target selection into the named-hit ring / worldObjByName - that made
     -- kill FX stick to a distant living target when AOE killed same-named mobs nearby.
 end
 
+-- Read-only half: the last snapshot. Never refreshes TargetInfo.
+function UnrealFX.getHostileSnapshot()
+    return UnrealFX.targetSnap.hostile
+end
+
+function UnrealFX.getMouseoverSnapshot()
+    return UnrealFX.targetSnap.mouseover
+end
+
 function UnrealFX.OnPlayerTargetUpdated(targetClassification, targetId, targetType)
-    -- Always refresh from TargetInfo; targetId alone is unreliable on some ticks.
-    UnrealFX.captureHostileTarget()
+    -- The only TargetInfo:UpdateFromClient caller; targetId alone is unreliable.
+    UnrealFX.snapshotTargets(true)
 end
 
 local COMBAT_HIT_META = { fromCombat = true }
@@ -2240,18 +2301,14 @@ function UnrealFX.OnWorldObjCombatEvent(hitTargetObjectNumber, hitAmount, textTy
             name = n
         end
     end
-    -- Hostile/mouseover often has the name when GetNameForObject is empty on the hit tick.
-    if (name == nil or name == L"") and TargetInfo and type(TargetInfo.UnitEntityId) == "function" then
-        local slots = getHitNameSlots()
-        for i = 1, #slots do
-            local slot = slots[i]
-            if (tonumber(TargetInfo:UnitEntityId(slot)) or 0) == id then
-                local tn = TargetInfo:UnitName(slot)
-                if tn and tn ~= L"" then
-                    name = tn
-                    break
-                end
-            end
+    -- Hostile/mouseover snapshot often has the name when GetNameForObject is empty.
+    if name == nil or name == L"" then
+        local snap = UnrealFX.targetSnap.hostile
+        if snap.id ~= id then
+            snap = UnrealFX.targetSnap.mouseover
+        end
+        if snap.id == id and snap.name ~= L"" then
+            name = snap.name
         end
     end
 
@@ -2429,10 +2486,6 @@ function UnrealFX.resolveWorldObjForVictim(victimName, opts)
     local avoidId = tonumber(opts.avoidWorldId) or 0
     if avoidId == 0 and opts.skipCurrentTarget then
         avoidId = UnrealFX.getLivingHostileWorldId()
-    end
-
-    if not opts.skipCapture then
-        UnrealFX.captureHostileTarget()
     end
 
     local function accept(id)
@@ -3192,7 +3245,7 @@ function UnrealFX.OnModulesInitialized()
     -- Initialize ran before saved settings or player data were restored.
     UnrealFX.updatePullAlertWatch()
     -- Target slot is valid after modules init; Initialize often ran too early for lastHostile.
-    UnrealFX.captureHostileTarget()
+    UnrealFX.snapshotTargets(false)
     UnrealFX.ensureFxPool()
 end
 
@@ -3831,16 +3884,9 @@ end
 function UnrealFX.playKeyword(keyword)
     local resolved = UnrealFX.logPlaybackKeyword(keyword)
     -- Prefer attaching to current hostile target when testing a kill FX sound.
-    local worldId = 0
-    if TargetInfo and type(TargetInfo.UnitEntityId) == "function" then
-        if type(TargetInfo.UpdateFromClient) == "function" then
-            pcall(function() TargetInfo:UpdateFromClient() end)
-        end
-        local slot = TargetInfo.HOSTILE_TARGET
-        worldId = tonumber(TargetInfo:UnitEntityId(slot)) or 0
-        if worldId == 0 then
-            worldId = tonumber(TargetInfo:UnitEntityId("mouseovertarget")) or 0
-        end
+    local worldId = UnrealFX.targetSnap.hostile.id
+    if worldId == 0 then
+        worldId = UnrealFX.targetSnap.mouseover.id
     end
     UnrealFX.playSoundFx(resolved, worldId)
     UnrealFX.chatPrint("Triggered alert: " .. resolved)
