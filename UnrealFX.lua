@@ -246,8 +246,8 @@ UnrealFX.FX_PENDING_SECONDS = 0.55
 UnrealFX.FX_KILL_RESOLVE_FIRST = 0.15
 UnrealFX.FX_KILL_RESOLVE_LAST = 0.30
 UnrealFX.FX_PENDING_SCAN_PER_FRAME = 48
--- Soft-attach (hidden) on combat hits while the world object still exists - kill chat
--- often arrives after the corpse is gone; AttachWindowToWorldObject then cannot bind.
+-- Soft-arm window: an id damaged by you within this many seconds is a kill candidate
+-- (hit ring timestamp only; nothing is attached on hit).
 UnrealFX.FX_ARM_SECONDS = 8.0
 -- After a kill FX plays on a world id, ignore that id for re-arm / re-FX briefly.
 UnrealFX.FX_DONE_SECONDS = 8.0
@@ -805,8 +805,8 @@ function UnrealFX.consumeCombatHitWorldId(worldId)
     end
 end
 
--- Soft-arm still uses Attach (hidden). Playing kill FX follows stock chat bubbles:
--- MoveWindowToWorldObject each tick (no Attach), which avoids sticky top-left binds.
+-- Older clients without MoveWindowToWorldObject only: Attach rebind. Normally kill FX
+-- follow stock chat bubbles (Move each tick, no Attach), avoiding sticky top-left binds.
 function UnrealFX.rebindFxToWorldObject(win, worldId)
     worldId = tonumber(worldId) or 0
     if not win or not DoesWindowExist(win) or worldId == 0 then
@@ -1005,41 +1005,6 @@ function UnrealFX.sampleFxProjection(inst, win)
     inst.lastY = y
     inst.hasLastPos = true
     return true
-end
-
--- Drop any Attach and project onto toWorldId instead.
-function UnrealFX.fallbackFxProjectToWorldId(win, fromWorldId, toWorldId)
-    toWorldId = tonumber(toWorldId) or 0
-    if toWorldId == 0 or not win or not DoesWindowExist(win) then
-        return 0
-    end
-    fromWorldId = tonumber(fromWorldId) or 0
-    if type(DetachWindowFromWorldObject) == "function" then
-        if fromWorldId ~= 0 then
-            pcall(DetachWindowFromWorldObject, win, fromWorldId)
-        end
-        if toWorldId ~= fromWorldId then
-            pcall(DetachWindowFromWorldObject, win, toWorldId)
-        end
-    end
-    if not UnrealFX.projectFxToWorldObject(win, toWorldId) then
-        return 0
-    end
-    return toWorldId
-end
-
--- Unknown id: victim / 0% HP hostile first, then self.
-function UnrealFX.fallbackFxProjectToHostileOrSelf(win, fromWorldId)
-    local toId = UnrealFX.resolveFxDisplayFallbackWorldId(fromWorldId)
-    if toId == 0 then
-        return 0
-    end
-    return UnrealFX.fallbackFxProjectToWorldId(win, fromWorldId, toId)
-end
-
--- Drop any Attach and project onto the local player instead.
-function UnrealFX.fallbackFxProjectToSelf(win, fromWorldId)
-    return UnrealFX.fallbackFxProjectToWorldId(win, fromWorldId, UnrealFX.getSelfWorldObjNum())
 end
 
 function UnrealFX.markFxDoneWorldId(worldId)
