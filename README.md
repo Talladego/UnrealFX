@@ -32,7 +32,7 @@ Uses PyInstaller one-file / windowed. Stdlib only (`tkinter`, `winsound`).
 | Command | Purpose |
 | --- | --- |
 | `/ufx help` | Command help |
-| `/ufx fx <name> [grow\|spin]` | Test overlay (optional motion) |
+| `/ufx fx <name> [grow\|spin\|spiral]` | Test overlay (optional motion) |
 | `/ufx fx scale [n\|reset]` | Overlay scale |
 | `/ufx alerts …` | Toggle alerts (see below) |
 | `/ufx play <keyword>` | Play a WAV keyword |

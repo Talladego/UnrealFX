@@ -21,8 +21,8 @@ UnrealFX.FX_SCALE_DEFAULT = 0.75
 UnrealFX.FX_SCALE_MIN = 0.25
 UnrealFX.FX_SCALE_MAX = 1.5
 UnrealFX.FX_MAX_INSTANCES = 12
--- FX timeline: snappy grow/spin intro -> shake/pulse -> brief hold -> fade.
--- Grow and spin share the same intro duration (spin only adds rotation).
+-- FX timeline: snappy grow/spin/spiral intro -> shake/pulse -> brief hold -> fade.
+-- All intro motions share the same duration; spin rotates texture, spiral orbits position.
 UnrealFX.FX_GROW_SECONDS = 0.45
 UnrealFX.FX_SPIN_GROW_SECONDS = UnrealFX.FX_GROW_SECONDS
 UnrealFX.FX_SHAKE_SECONDS = 0.65
@@ -41,8 +41,13 @@ UnrealFX.FX_PUNCH_SCALE_PEAK = 1.06
 UnrealFX.FX_PUNCH_GROW_FRAC = 0.6
 -- Spin-grow: start rotated by this many degrees (sign = direction), ease to 0.
 UnrealFX.FX_SPIN_DEGREES = 720
--- Motions randomly chosen per FX unless opts.motion / /ufx fx <key> spin|grow.
-UnrealFX.FX_MOTIONS = { "grow", "spin" }
+-- Spiral-grow: orbit anchor into center (no texture spin; radius in display pixels at scale 1).
+UnrealFX.FX_SPIRAL_RADIUS = 56
+UnrealFX.FX_SPIRAL_TURNS = 2.0
+-- Motions randomly chosen per FX unless opts.motion / /ufx fx <key> grow|spin|spiral.
+UnrealFX.FX_MOTIONS = { "grow", "spin", "spiral" }
+-- Chat-bubble style projection height for MoveWindowToWorldObject (stock uses 1.0).
+UnrealFX.FX_ATTACH_HEIGHT = 1.0
 UnrealFX.fxActive = UnrealFX.fxActive or {} -- [1..n] = { win, attachedId, key, phase, t, image }
 UnrealFX.fxFree = UnrealFX.fxFree or {} -- recycled instances (never DestroyWindow - crashes WAR)
 UnrealFX.fxPoolReady = UnrealFX.fxPoolReady or false
@@ -66,6 +71,13 @@ UnrealFX.FX_PENDING_SCAN_PER_FRAME = 48
 UnrealFX.FX_ARM_SECONDS = 8.0
 -- After a kill FX plays on a world id, ignore that id for re-arm / re-FX briefly.
 UnrealFX.FX_DONE_SECONDS = 8.0
+-- Pair WORLD_OBJ_COMBAT_EVENT (id+amount) with YOUR_HITS combat chat (name+amount).
+-- On kill, score several recent pairs and pick the best match for the victim name.
+UnrealFX.FX_DAMAGE_PAIR_SECONDS = 3.0
+UnrealFX.FX_DAMAGE_PAIR_MAX = 24
+UnrealFX.FX_DAMAGE_PAIR_CHAT_CANDIDATES = 8
+UnrealFX.recentDamageEvents = UnrealFX.recentDamageEvents or {} -- { id, amount, t, used }
+UnrealFX.recentDamageChats = UnrealFX.recentDamageChats or {} -- { key, amount, t, used }
 UnrealFX.fxClock = UnrealFX.fxClock or 0
 UnrealFX.fxDoneWorldIds = UnrealFX.fxDoneWorldIds or {}
 UnrealFX.pendingFxQueue = UnrealFX.pendingFxQueue or {}
@@ -399,9 +411,8 @@ function UnrealFX.getPlayerWorldObjNum()
     return 0
 end
 
--- Living current hostile (HP > 0). Never promote kill FX onto this id - GroupIcons
--- keeps attaches on corpses, but living targets must not get deathblow art.
-function UnrealFX.getLivingHostileWorldId()
+-- Current hostile entity id (any HP). Used when victim world id is unknown.
+function UnrealFX.getCurrentHostileWorldId()
     if not (TargetInfo and type(TargetInfo.UnitEntityId) == "function") then
         return 0
     end
@@ -409,13 +420,20 @@ function UnrealFX.getLivingHostileWorldId()
         pcall(function() TargetInfo:UpdateFromClient() end)
     end
     local slot = TargetInfo.HOSTILE_TARGET or "selfhostiletarget"
-    local id = tonumber(TargetInfo:UnitEntityId(slot)) or 0
+    return tonumber(TargetInfo:UnitEntityId(slot)) or 0
+end
+
+-- Living current hostile (HP > 0). resolveWorldObjForKill prefers other candidates
+-- so AOE same-name kills are not stamped onto a still-living target.
+function UnrealFX.getLivingHostileWorldId()
+    local id = UnrealFX.getCurrentHostileWorldId()
     if id == 0 then
         return 0
     end
-    if type(TargetInfo.UnitHealth) ~= "function" then
+    if not (TargetInfo and type(TargetInfo.UnitHealth) == "function") then
         return 0
     end
+    local slot = TargetInfo.HOSTILE_TARGET or "selfhostiletarget"
     local hp = tonumber(TargetInfo:UnitHealth(slot))
     if hp == nil or hp > 0 then
         -- Missing HP: do not treat as living-avoid (targeted kill path needs the id).
@@ -423,6 +441,20 @@ function UnrealFX.getLivingHostileWorldId()
             return 0
         end
         return id
+    end
+    return 0
+end
+
+-- When the kill victim id is unknown / projection fails: current hostile, else self.
+function UnrealFX.resolveFxDisplayFallbackWorldId(excludeId)
+    excludeId = tonumber(excludeId) or 0
+    local hid = UnrealFX.getCurrentHostileWorldId()
+    if hid ~= 0 and hid ~= excludeId then
+        return hid
+    end
+    local selfId = UnrealFX.getSelfWorldObjNum()
+    if selfId ~= 0 and selfId ~= excludeId then
+        return selfId
     end
     return 0
 end
@@ -444,7 +476,8 @@ function UnrealFX.consumeCombatHitWorldId(worldId)
     end
 end
 
--- GroupIcons pattern: Detach + Attach + ForceUpdate (corpse keeps the same worldObjNum).
+-- Soft-arm still uses Attach (hidden). Playing kill FX follows stock chat bubbles:
+-- MoveWindowToWorldObject each tick (no Attach), which avoids sticky top-left binds.
 function UnrealFX.rebindFxToWorldObject(win, worldId)
     worldId = tonumber(worldId) or 0
     if not win or not DoesWindowExist(win) or worldId == 0 then
@@ -461,6 +494,76 @@ function UnrealFX.rebindFxToWorldObject(win, worldId)
         pcall(ForceUpdateWorldObjectWindow, worldId, win)
     end
     return true
+end
+
+-- ChatManager.UpdateChatBubbles: one-shot project. Cheap; max FX_MAX_INSTANCES / frame.
+function UnrealFX.projectFxToWorldObject(win, worldId)
+    worldId = tonumber(worldId) or 0
+    if not win or not DoesWindowExist(win) or worldId == 0 then
+        return false
+    end
+    if type(MoveWindowToWorldObject) == "function" then
+        local height = UnrealFX.FX_ATTACH_HEIGHT or 1.0
+        pcall(MoveWindowToWorldObject, win, worldId, height)
+        return true
+    end
+    -- Older clients without Move: fall back to Attach rebind.
+    return UnrealFX.rebindFxToWorldObject(win, worldId)
+end
+
+-- Failed / off-screen world binds park the window at screen origin (same GroupIcons
+-- stuck-icon symptom). See docs/api/world-object-windows.md.
+function UnrealFX.isFxWindowStuckAtOrigin(win)
+    if not win or not DoesWindowExist(win) or type(WindowGetScreenPosition) ~= "function" then
+        return false
+    end
+    local x, y = WindowGetScreenPosition(win)
+    x = tonumber(x)
+    y = tonumber(y)
+    if x == nil or y == nil then
+        return false
+    end
+    return x >= 0 and x < 2 and y >= 0 and y < 2
+end
+
+-- Drop any Attach and project onto toWorldId instead.
+function UnrealFX.fallbackFxProjectToWorldId(win, fromWorldId, toWorldId)
+    toWorldId = tonumber(toWorldId) or 0
+    if toWorldId == 0 or not win or not DoesWindowExist(win) then
+        return 0
+    end
+    fromWorldId = tonumber(fromWorldId) or 0
+    if type(DetachWindowFromWorldObject) == "function" then
+        if fromWorldId ~= 0 then
+            pcall(DetachWindowFromWorldObject, win, fromWorldId)
+        end
+        if toWorldId ~= fromWorldId then
+            pcall(DetachWindowFromWorldObject, win, toWorldId)
+        end
+    end
+    if not UnrealFX.projectFxToWorldObject(win, toWorldId) then
+        return 0
+    end
+    return toWorldId
+end
+
+-- Stuck / unknown id: current hostile first, then self.
+function UnrealFX.fallbackFxProjectToHostileOrSelf(win, fromWorldId)
+    local toId = UnrealFX.resolveFxDisplayFallbackWorldId(fromWorldId)
+    if toId == 0 then
+        return 0
+    end
+    return UnrealFX.fallbackFxProjectToWorldId(win, fromWorldId, toId)
+end
+
+-- Drop any Attach and project onto the local player instead.
+function UnrealFX.fallbackFxProjectToSelf(win, fromWorldId)
+    return UnrealFX.fallbackFxProjectToWorldId(win, fromWorldId, UnrealFX.getSelfWorldObjNum())
+end
+
+-- Back-compat name used by earlier drafts.
+function UnrealFX.fallbackFxAttachToSelf(win, fromWorldId)
+    return UnrealFX.fallbackFxProjectToSelf(win, fromWorldId)
 end
 
 function UnrealFX.markFxDoneWorldId(worldId)
@@ -520,6 +623,242 @@ function UnrealFX.isUsableVictimWorldId(id, usedIds, avoidId)
 end
 
 -- Same source SCT uses: live EventTracker.m_TargetObject + WORLD_OBJ_COMBAT_EVENT ids.
+function UnrealFX.pruneDamagePairBuffer(list, maxN, maxAge)
+    if type(list) ~= "table" then
+        return
+    end
+    maxN = maxN or UnrealFX.FX_DAMAGE_PAIR_MAX or 24
+    maxAge = maxAge or UnrealFX.FX_DAMAGE_PAIR_SECONDS or 3.0
+    local now = UnrealFX.fxClock or 0
+    local i = 1
+    while i <= #list do
+        local e = list[i]
+        local age = now - (e and tonumber(e.t) or 0)
+        if not e or age > maxAge then
+            table.remove(list, i)
+        else
+            i = i + 1
+        end
+    end
+    while #list > maxN do
+        table.remove(list, 1)
+    end
+end
+
+function UnrealFX.pushDamagePairBuffer(list, entry)
+    if type(list) ~= "table" or type(entry) ~= "table" then
+        return
+    end
+    list[#list + 1] = entry
+    UnrealFX.pruneDamagePairBuffer(list)
+end
+
+-- Outgoing damage event: world id + absolute damage amount.
+function UnrealFX.rememberRecentDamageEvent(worldId, amount)
+    worldId = tonumber(worldId) or 0
+    amount = math.abs(tonumber(amount) or 0)
+    if worldId == 0 or amount == 0 or worldId == UnrealFX.getPlayerWorldObjNum() then
+        return
+    end
+    local list = UnrealFX.recentDamageEvents
+    if type(list) ~= "table" then
+        list = {}
+        UnrealFX.recentDamageEvents = list
+    end
+    UnrealFX.pushDamagePairBuffer(list, {
+        id = worldId,
+        amount = amount,
+        t = UnrealFX.fxClock or 0,
+        used = false,
+    })
+end
+
+-- Combat YOUR_HITS / PET_HITS: "Your X hits Target for N damage."
+function UnrealFX.parseOutgoingDamageCombatLog(msg, isPetHit)
+    local s = UnrealFX.toNarrow(msg)
+    if s == "" then
+        return nil
+    end
+    local targetName, damageStr
+    if isPetHit then
+        _, _, targetName, damageStr =
+            string.match(s, "^Your (.+)'s (.+) critically hits (.+) for (%d+) damage")
+        if targetName == nil then
+            _, _, targetName, damageStr =
+                string.match(s, "^Your (.+)'s (.+) hits (.+) for (%d+) damage")
+        end
+    else
+        _, targetName, damageStr =
+            string.match(s, "^Your (.+) critically hits (.+) for (%d+) damage")
+        if targetName == nil then
+            _, targetName, damageStr =
+                string.match(s, "^Your (.+) hits (.+) for (%d+) damage")
+        end
+    end
+    if targetName == nil then
+        return nil
+    end
+    local amount = tonumber(damageStr) or 0
+    if amount == 0 then
+        return nil
+    end
+    return {
+        key = UnrealFX.normalizeUnitName(targetName),
+        amount = amount,
+    }
+end
+
+function UnrealFX.rememberRecentDamageChat(nameOrKey, amount)
+    local key = UnrealFX.normalizeUnitName(nameOrKey)
+    amount = math.abs(tonumber(amount) or 0)
+    if key == L"" or amount == 0 then
+        return
+    end
+    local list = UnrealFX.recentDamageChats
+    if type(list) ~= "table" then
+        list = {}
+        UnrealFX.recentDamageChats = list
+    end
+    UnrealFX.pushDamagePairBuffer(list, {
+        key = key,
+        amount = amount,
+        t = UnrealFX.fxClock or 0,
+        used = false,
+    })
+end
+
+function UnrealFX.onOutgoingDamageCombatLog(filterType)
+    local filters = SystemData and SystemData.ChatLogFilters
+    if not filters then
+        return
+    end
+    local isPet = filterType == filters.PET_HITS
+    if not isPet and filterType ~= filters.YOUR_HITS then
+        return
+    end
+    local num = TextLogGetNumEntries("Combat") - 1
+    if num < 0 then
+        return
+    end
+    local _, _, msg = TextLogGetEntry("Combat", num)
+    local hit = UnrealFX.parseOutgoingDamageCombatLog(msg, isPet)
+    if not hit then
+        return
+    end
+    UnrealFX.rememberRecentDamageChat(hit.key, hit.amount)
+end
+
+-- Score a chat line (name+amount) against a damage event (id+amount). Higher is better.
+-- Returns nil if incompatible.
+function UnrealFX.scoreDamagePair(chat, event, wantKey, now)
+    if type(chat) ~= "table" or type(event) ~= "table" then
+        return nil
+    end
+    if chat.used or event.used then
+        return nil
+    end
+    local amount = tonumber(chat.amount) or 0
+    if amount == 0 or amount ~= (tonumber(event.amount) or 0) then
+        return nil
+    end
+    local chatKey = chat.key
+    if wantKey and wantKey ~= L"" and chatKey ~= wantKey then
+        return nil
+    end
+    local id = tonumber(event.id) or 0
+    if id == 0 then
+        return nil
+    end
+
+    now = now or (UnrealFX.fxClock or 0)
+    local chatAge = now - (tonumber(chat.t) or 0)
+    local eventAge = now - (tonumber(event.t) or 0)
+    local timeSkew = math.abs((tonumber(chat.t) or 0) - (tonumber(event.t) or 0))
+    local maxAge = UnrealFX.FX_DAMAGE_PAIR_SECONDS or 3.0
+    if chatAge > maxAge or eventAge > maxAge then
+        return nil
+    end
+
+    local score = 1000
+    -- Prefer fresher chat lines and events that landed near that chat.
+    score = score - (chatAge * 40) - (eventAge * 15) - (timeSkew * 80)
+
+    local nameHit = UnrealFX.probeWorldObjName(id, chatKey)
+    if nameHit ~= 0 then
+        score = score + 2000
+    elseif type(GetNameForObject) == "function" then
+        local ok, n = pcall(GetNameForObject, id)
+        if ok and n and n ~= L"" and not UnrealFX.namesEqual(n, chatKey) then
+            -- Amount matched a different named entity - reject.
+            return nil
+        end
+    end
+
+    return score
+end
+
+-- Among recent damage chats for victimName, pick the best amount-matched event id.
+-- Skip the living current hostile (HP > 0) — that is still targeted, not the corpse.
+function UnrealFX.findBestDamagePairWorldId(victimName, usedIds)
+    local want = UnrealFX.normalizeUnitName(victimName)
+    if want == L"" then
+        return 0
+    end
+    UnrealFX.pruneDamagePairBuffer(UnrealFX.recentDamageEvents)
+    UnrealFX.pruneDamagePairBuffer(UnrealFX.recentDamageChats)
+
+    local chats = UnrealFX.recentDamageChats
+    local events = UnrealFX.recentDamageEvents
+    if type(chats) ~= "table" or type(events) ~= "table" then
+        return 0
+    end
+
+    local now = UnrealFX.fxClock or 0
+    local maxChats = UnrealFX.FX_DAMAGE_PAIR_CHAT_CANDIDATES or 8
+    local livingTargetId = UnrealFX.getLivingHostileWorldId()
+    local bestScore, bestEvent, bestChat = nil, nil, nil
+    local considered = 0
+
+    for ci = #chats, 1, -1 do
+        local chat = chats[ci]
+        if chat and not chat.used and chat.key == want then
+            considered = considered + 1
+            if considered > maxChats then
+                break
+            end
+            for ei = #events, 1, -1 do
+                local event = events[ei]
+                local score = UnrealFX.scoreDamagePair(chat, event, want, now)
+                if score ~= nil then
+                    local id = tonumber(event.id) or 0
+                    -- Living current target: keep searching for another pair.
+                    if livingTargetId ~= 0 and id == livingTargetId then
+                        id = 0
+                    end
+                    if id ~= 0
+                        and UnrealFX.isUsableVictimWorldId(id, usedIds, 0)
+                        and (bestScore == nil or score > bestScore)
+                    then
+                        bestScore = score
+                        bestEvent = event
+                        bestChat = chat
+                    end
+                end
+            end
+        end
+    end
+
+    if not bestEvent or not bestChat then
+        return 0
+    end
+    bestEvent.used = true
+    bestChat.used = true
+    local id = tonumber(bestEvent.id) or 0
+    UnrealFX.rememberWorldObjName(id, want)
+    UnrealFX.rememberRecentNamedHit(id, want, { fromCombat = true })
+    return id
+end
+
 -- Newest-first. Does not touch recentNamedHits (avoids reordering / target pollution).
 function UnrealFX.collectCombatHitWorldObjsNewestFirst()
     local ordered = {}
@@ -551,11 +890,8 @@ function UnrealFX.collectCombatHitWorldObjsNewestFirst()
     return ordered
 end
 
--- Kill FX world id. Learn ids while alive (combat event + SCT trackers + soft-arm);
--- corpses keep the same worldObjNum (GroupIcons). Prefer non-living candidates so
--- AOE same-name kills do not stamp a still-living target; if the only match is the
--- current hostile with HP still >0 (common for a tick after the kill line), allow it.
--- Self fallback is handled by playKillFx / announce when this returns 0.
+-- Kill FX world id. Prefer best damage-event/combat-chat amount+name pair, then
+-- soft-arm / SCT / dead hostile. Self fallback is handled by playKillFx / announce.
 function UnrealFX.resolveWorldObjForKill(victimName, usedIds)
     local want = UnrealFX.normalizeUnitName(victimName)
     if want == L"" then
@@ -579,6 +915,12 @@ function UnrealFX.resolveWorldObjForKill(victimName, usedIds)
             return true
         end
         return UnrealFX.probeWorldObjName(id, want) ~= 0
+    end
+
+    -- 0) Best YOUR_HITS chat + WORLD_OBJ_COMBAT_EVENT amount pair for this victim.
+    local pairId = UnrealFX.findBestDamagePairWorldId(want, usedIds)
+    if pairId ~= 0 then
+        return pairId
     end
 
     -- 1) Soft-armed binds: prefer ids that are not the living hostile (AOE same-name),
@@ -815,10 +1157,21 @@ function UnrealFX.processPlayerKill(victimName, currenttime)
 end
 
 function UnrealFX.OnCombatHappened(updateType, filterType)
-    if not (filterType == SystemData.ChatLogFilters.RVR_KILLS_ORDER or filterType == SystemData.ChatLogFilters.RVR_KILLS_DESTRUCTION) then
+    if updateType ~= SystemData.TextLogUpdate.ADDED then
         return
     end
-    if updateType ~= SystemData.TextLogUpdate.ADDED then
+
+    local filters = SystemData and SystemData.ChatLogFilters
+    if filters
+        and (filterType == filters.YOUR_HITS or filterType == filters.PET_HITS)
+    then
+        UnrealFX.onOutgoingDamageCombatLog(filterType)
+        return
+    end
+
+    if not filters
+        or not (filterType == filters.RVR_KILLS_ORDER or filterType == filters.RVR_KILLS_DESTRUCTION)
+    then
         return
     end
 
@@ -971,15 +1324,10 @@ function UnrealFX.announcePlayerKill(killType, victimName)
                         label = UnrealFX.toNarrow(UnrealFX.normalizeUnitName(name)),
                     })
                 else
-                    -- Kill line can race soft-arm / HP update (especially first kill after
-                    -- /reload). Retry briefly before self fallback.
-                    UnrealFX.queuePendingFx(fxKey, name, {
-                        allowSelf = true,
-                        killResolve = true,
-                        usedIds = seenIds,
-                    })
-                    UnrealFX.markKillSpreeFxShown(entry, 0)
-                    return
+                    -- Unknown victim after damage-pair / resolve -> self.
+                    shown = UnrealFX.showFxOnSelf(fxKey, { quiet = true })
+                    worldId = UnrealFX.getSelfWorldObjNum()
+                    entry.worldId = worldId
                 end
                 if not shown then
                     shown = UnrealFX.playKillFx(fxKey, name, { usedIds = seenIds })
@@ -1035,6 +1383,25 @@ function UnrealFX.showFxOnSelf(requestedKey, opts)
         opts.label = "player"
     end
     return UnrealFX.showFxOnWorldObject(requestedKey, selfId, opts)
+end
+
+-- Victim id unknown: current hostile target, else self.
+function UnrealFX.showFxOnHostileOrSelf(requestedKey, opts)
+    opts = opts or {}
+    UnrealFX.captureHostileTarget()
+    local hid = UnrealFX.getCurrentHostileWorldId()
+    if hid ~= 0 then
+        if not opts.label then
+            local last = UnrealFX.lastHostile
+            if last and (tonumber(last.id) or 0) == hid then
+                opts.label = UnrealFX.toNarrow(last.name or L"hostile")
+            else
+                opts.label = "hostile"
+            end
+        end
+        return UnrealFX.showFxOnWorldObject(requestedKey, hid, opts)
+    end
+    return UnrealFX.showFxOnSelf(requestedKey, opts)
 end
 
 function UnrealFX.resolvePlaybackKeyword(keyword)
@@ -1111,6 +1478,9 @@ function UnrealFX.pickFxMotion(opts)
         want = string.lower(UnrealFX.trim(want))
         if want == "spin" or want == "spinning" then
             return "spin"
+        end
+        if want == "spiral" or want == "spiraling" or want == "spiralling" then
+            return "spiral"
         end
         if want == "grow" or want == "punch" or want == "default" then
             return "grow"
@@ -1252,6 +1622,9 @@ function UnrealFX.releaseFxInstance(inst)
     inst.key = nil
     inst.motion = nil
     inst.spinStartDeg = nil
+    inst.spiralDir = nil
+    inst.useMoveProject = nil
+    inst.fellBackToSelf = nil
     inst.armKey = nil
     inst.armName = nil
     inst.screenPinned = nil
@@ -1365,6 +1738,25 @@ function UnrealFX.tickFxInstance(inst, elapsed)
         return true
     end
 
+    -- Playing FX: chat-bubble projection each tick (no Attach). If the id parks at
+    -- screen origin / is off-screen, remount onto current hostile, else self.
+    if inst.useMoveProject then
+        local followId = tonumber(inst.attachedId) or 0
+        if followId ~= 0 then
+            UnrealFX.projectFxToWorldObject(win, followId)
+            if not inst.fellBackToSelf and UnrealFX.isFxWindowStuckAtOrigin(win) then
+                local fb = UnrealFX.fallbackFxProjectToHostileOrSelf(win, followId)
+                if fb ~= 0 then
+                    inst.attachedId = fb
+                    local selfId = UnrealFX.getSelfWorldObjNum()
+                    if selfId ~= 0 and fb == selfId then
+                        inst.fellBackToSelf = true
+                    end
+                end
+            end
+        end
+    end
+
     local motion = inst.motion or "grow"
     -- Grow and spin share one intro length (spin only adds rotation).
     local growDur = UnrealFX.FX_GROW_SECONDS
@@ -1382,7 +1774,7 @@ function UnrealFX.tickFxInstance(inst, elapsed)
         return false
     end
 
-    -- 1) Grow into configured scale (rel 1.0). "spin" also unwinds rotation to 0 deg.
+    -- 1) Grow into configured scale (rel 1.0). spin rotates texture; spiral orbits anchor only.
     if t < growDur then
         inst.phase = "grow"
         local u = t / growDur
@@ -1392,7 +1784,20 @@ function UnrealFX.tickFxInstance(inst, elapsed)
             u = 1
         end
         if DoesWindowExist(image) then
-            UnrealFX.anchorFxImageCenter(win, image, 0, 0)
+            -- Ease-out cubic: motion settles before shake.
+            local e = 1 - (1 - u) * (1 - u) * (1 - u)
+            local dx, dy = 0, 0
+            if motion == "spiral" then
+                local turns = UnrealFX.FX_SPIRAL_TURNS or 2.0
+                local radius0 = (UnrealFX.FX_SPIRAL_RADIUS or 56) * UnrealFX.getFxScale()
+                local radius = radius0 * (1 - e)
+                local dir = tonumber(inst.spiralDir) or 1
+                local ang = dir * 2 * math.pi * turns * e
+                dx = radius * math.cos(ang)
+                dy = radius * math.sin(ang)
+            end
+            UnrealFX.anchorFxImageCenter(win, image, dx, dy)
+
             local scale = UnrealFX.computeFxGrowScale(u)
             if type(WindowSetRelativeScale) == "function" then
                 WindowSetRelativeScale(image, scale)
@@ -1400,8 +1805,6 @@ function UnrealFX.tickFxInstance(inst, elapsed)
                 WindowSetScale(image, scale)
             end
             if motion == "spin" then
-                -- Ease-out cubic so most of the spin finishes before settle.
-                local e = 1 - (1 - u) * (1 - u) * (1 - u)
                 local startDeg = tonumber(inst.spinStartDeg) or (UnrealFX.FX_SPIN_DEGREES or 720)
                 UnrealFX.setFxImageRotation(image, startDeg * (1 - e))
             else
@@ -1695,6 +2098,12 @@ function UnrealFX.OnWorldObjCombatEvent(hitTargetObjectNumber, hitAmount, textTy
     end
 
     UnrealFX.rememberRecentWorldObjId(id)
+
+    -- Outgoing damage (negative amount) for YOUR_HITS chat pairing on kill resolve.
+    local amount = tonumber(hitAmount) or 0
+    if amount < 0 then
+        UnrealFX.rememberRecentDamageEvent(id, -amount)
+    end
 
     local name = nil
     if type(GetNameForObject) == "function" then
@@ -2088,7 +2497,7 @@ function UnrealFX.tickPendingFx(elapsed)
         elseif pending.t >= (UnrealFX.FX_PENDING_SECONDS or 0.55) then
             table.remove(queue, i)
             if pending.allowSelf then
-                UnrealFX.showFxOnSelf(pending.fxKey, {
+                UnrealFX.showFxOnHostileOrSelf(pending.fxKey, {
                     quiet = true,
                     label = pending.label,
                 })
@@ -2177,11 +2586,16 @@ function UnrealFX.showFxOnWorldObject(requestedKey, worldId, opts)
     local win = inst.win
     local image = inst.image or (win .. "Image")
     local prevId = tonumber(inst.attachedId) or 0
-    -- Detach when switching objects. Same-id: still re-Attach below (death clears binds).
-    if prevId ~= 0 and prevId ~= worldId and type(DetachWindowFromWorldObject) == "function" then
-        pcall(DetachWindowFromWorldObject, win, prevId)
-        inst.attachedId = nil
+    -- Drop soft-arm Attach so play uses bubble-style Move only (avoids Attach+Move fight).
+    if type(DetachWindowFromWorldObject) == "function" then
+        if prevId ~= 0 then
+            pcall(DetachWindowFromWorldObject, win, prevId)
+        end
+        if worldId ~= 0 and worldId ~= prevId then
+            pcall(DetachWindowFromWorldObject, win, worldId)
+        end
     end
+    inst.attachedId = nil
 
     local dispW, dispH = UnrealFX.getFxDisplaySize()
     WindowSetDimensions(win, dispW, dispH)
@@ -2203,25 +2617,72 @@ function UnrealFX.showFxOnWorldObject(requestedKey, worldId, opts)
     end
     UnrealFX.resetFxMotionVisuals(win)
     UnrealFX.setFxAlpha(win, image, 1.0)
-    WindowSetShowing(win, true)
 
-    -- GroupIcons Rebind: Detach+Attach+ForceUpdate. Corpse keeps the same worldObjNum.
-    UnrealFX.rebindFxToWorldObject(win, worldId)
+    local useMove = type(MoveWindowToWorldObject) == "function"
+    local attachId = worldId
+    UnrealFX.projectFxToWorldObject(win, attachId)
+    if type(ForceUpdateWorldObjectWindow) == "function" then
+        pcall(ForceUpdateWorldObjectWindow, attachId, win)
+    end
+
+    local selfId = UnrealFX.getSelfWorldObjNum()
+    local fellBack = false
+    if not opts.noSelfFallback
+        and attachId ~= selfId
+        and UnrealFX.isFxWindowStuckAtOrigin(win)
+    then
+        local fb = UnrealFX.fallbackFxProjectToHostileOrSelf(win, attachId)
+        if fb ~= 0 then
+            attachId = fb
+            fellBack = true
+            if opts.label == nil then
+                if selfId ~= 0 and fb == selfId then
+                    opts.label = "player"
+                else
+                    opts.label = "hostile"
+                end
+            end
+        end
+    end
+
+    WindowSetShowing(win, true)
+    UnrealFX.projectFxToWorldObject(win, attachId)
+    if type(ForceUpdateWorldObjectWindow) == "function" and attachId ~= 0 then
+        pcall(ForceUpdateWorldObjectWindow, attachId, win)
+    end
+    if not opts.noSelfFallback
+        and attachId ~= selfId
+        and UnrealFX.isFxWindowStuckAtOrigin(win)
+    then
+        local fb = UnrealFX.fallbackFxProjectToHostileOrSelf(win, attachId)
+        if fb ~= 0 then
+            attachId = fb
+            fellBack = true
+        end
+    end
 
     local motion = UnrealFX.pickFxMotion(opts)
     local spinStart = 0
+    local spiralDir = nil
     if motion == "spin" then
         local turns = UnrealFX.FX_SPIN_DEGREES or 720
         if math.random(2) == 1 then
             turns = -turns
         end
         spinStart = turns
+    elseif motion == "spiral" then
+        spiralDir = 1
+        if math.random(2) == 1 then
+            spiralDir = -1
+        end
     end
 
-    inst.attachedId = worldId
+    inst.attachedId = attachId
     inst.key = entry.key
     inst.motion = motion
     inst.spinStartDeg = spinStart
+    inst.spiralDir = spiralDir
+    inst.useMoveProject = useMove
     inst.phase = "grow"
     inst.t = 0
     inst.armKey = nil
@@ -2230,13 +2691,24 @@ function UnrealFX.showFxOnWorldObject(requestedKey, worldId, opts)
     inst.lastSX = nil
     inst.lastSY = nil
     inst.detachedForFade = nil
-    -- Block re-arm / re-FX on this corpse while the animation (and brief cooldown) run.
+    inst.fellBackToSelf = fellBack or (selfId ~= 0 and attachId == selfId)
+    -- Block re-arm / re-FX on the intended corpse even if we displayed on self.
     UnrealFX.markFxDoneWorldId(worldId)
+    if attachId ~= worldId then
+        UnrealFX.markFxDoneWorldId(attachId)
+    end
     UnrealFX.consumeCombatHitWorldId(worldId)
     UnrealFX.fxLastKey = entry.key
 
     if not opts.quiet then
-        local who = opts.label or ("worldObj " .. tostring(worldId))
+        local who = opts.label or ("worldObj " .. tostring(attachId))
+        if fellBack then
+            if selfId ~= 0 and attachId == selfId then
+                who = who .. " (self fallback)"
+            else
+                who = who .. " (hostile fallback)"
+            end
+        end
         local soundNote = ""
         if opts.sound and opts.sound ~= "" then
             soundNote = " + sound '" .. tostring(opts.sound) .. "'"
@@ -2284,13 +2756,11 @@ function UnrealFX.playKillFx(killType, victimName, opts)
         return true
     end
 
-    -- No known victim yet (reload race / AOE never tracked) -> brief retry, then self.
-    UnrealFX.queuePendingFx(fxKey, victimName, {
-        allowSelf = true,
-        killResolve = true,
-        usedIds = opts.usedIds,
+    -- Unknown victim world object -> self.
+    return UnrealFX.showFxOnSelf(fxKey, {
+        quiet = true,
+        label = UnrealFX.toNarrow(UnrealFX.normalizeUnitName(victimName)),
     })
-    return true
 end
 
 function UnrealFX.playSoundFx(keyword, worldId)
@@ -2410,18 +2880,20 @@ function UnrealFX.handleFxCommand(rest)
         return
     end
 
-    -- /ufx fx <key> [grow|spin]  - motion optional; otherwise random grow/spin.
+    -- /ufx fx <key> [grow|spin|spiral]  - motion optional; otherwise random.
     local key, motionArg = string.match(option, "^(%S+)%s+(%S+)$")
     if not key then
         key = option
     end
     if motionArg == "spinning" then
         motionArg = "spin"
+    elseif motionArg == "spiraling" or motionArg == "spiralling" then
+        motionArg = "spiral"
     elseif motionArg == "punch" or motionArg == "default" then
         motionArg = "grow"
     end
-    if motionArg and motionArg ~= "spin" and motionArg ~= "grow" then
-        UnrealFX.chatPrint("Usage: /ufx fx <name> [grow|spin]")
+    if motionArg and motionArg ~= "spin" and motionArg ~= "grow" and motionArg ~= "spiral" then
+        UnrealFX.chatPrint("Usage: /ufx fx <name> [grow|spin|spiral]")
         return
     end
     UnrealFX.showFxTest(key, motionArg)
