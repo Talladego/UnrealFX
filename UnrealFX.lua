@@ -861,19 +861,19 @@ function UnrealFX.rememberRecentDamageEvent(worldId, amount, abilityKey)
 end
 
 -- Combat YOUR_HITS / PET_HITS: "Your X hits Target for N damage."
--- Returns targetKey, amount, abilityKey (no table, runs on every hit line).
+-- Returns targetKey, amount, abilityKey, petName (narrow, pet lines only).
+-- No table: this runs on every hit line.
 function UnrealFX.parseOutgoingDamageCombatLog(msg, isPetHit)
     local s = UnrealFX.toNarrow(msg)
     if s == "" then
         return nil
     end
-    local ability, targetName, damageStr
+    local ability, targetName, damageStr, pet
     if isPetHit then
-        local _pet
-        _pet, ability, targetName, damageStr =
+        pet, ability, targetName, damageStr =
             string.match(s, "^Your (.+)'s (.+) critically hits (.+) for (%d+) damage")
         if targetName == nil then
-            _pet, ability, targetName, damageStr =
+            pet, ability, targetName, damageStr =
                 string.match(s, "^Your (.+)'s (.+) hits (.+) for (%d+) damage")
         end
     else
@@ -891,7 +891,51 @@ function UnrealFX.parseOutgoingDamageCombatLog(msg, isPetHit)
     if amount == 0 then
         return nil
     end
-    return UnrealFX.normalizeUnitName(targetName), amount, UnrealFX.normalizeAbilityKey(ability)
+    return UnrealFX.normalizeUnitName(targetName), amount, UnrealFX.normalizeAbilityKey(ability), pet
+end
+
+-- Pet name learned from "Your <Pet>'s ..." hit lines; key is rebuilt only on change.
+UnrealFX.learnedPetName = nil
+UnrealFX.learnedPetKey = L""
+
+function UnrealFX.learnPetName(pet)
+    if pet == nil or pet == "" or pet == UnrealFX.learnedPetName then
+        return
+    end
+    UnrealFX.learnedPetName = pet
+    UnrealFX.learnedPetKey = UnrealFX.normalizeUnitName(pet)
+end
+
+-- Normalized names the player's pet may appear under in kill lines.
+function UnrealFX.isPlayerPetKey(killerKey)
+    if killerKey == nil or killerKey == L"" then
+        return false
+    end
+    local pet = GameData and GameData.Player and GameData.Player.Pet
+    local petName = pet and pet.name
+    if petName ~= nil and petName ~= L"" and UnrealFX.normalizeUnitName(petName) == killerKey then
+        return true
+    end
+    return UnrealFX.learnedPetKey ~= L"" and UnrealFX.learnedPetKey == killerKey
+end
+
+-- Pet kill lines only count when we (or the pet) hit that victim recently, so another
+-- player's same-named pet does not trigger our FX.
+UnrealFX.FX_PET_KILL_RECENT_HIT_SECONDS = 10
+
+function UnrealFX.hasRecentDamageChatFor(key, maxAge)
+    local ring = UnrealFX.recentDamageChats
+    local now = UnrealFX.fxClock or 0
+    for k = 1, ring.count do
+        local entry = entryRingAt(ring, k)
+        if (now - (entry.t or 0)) > maxAge then
+            return false
+        end
+        if entry.key == key then
+            return true
+        end
+    end
+    return false
 end
 
 function UnrealFX.rememberRecentDamageChat(nameOrKey, amount, abilityKey)
@@ -922,9 +966,12 @@ function UnrealFX.onOutgoingDamageCombatLog(filterType)
         return
     end
     local _, _, msg = TextLogGetEntry("Combat", num)
-    local key, amount, abilityKey = UnrealFX.parseOutgoingDamageCombatLog(msg, isPet)
+    local key, amount, abilityKey, pet = UnrealFX.parseOutgoingDamageCombatLog(msg, isPet)
     if not key then
         return
+    end
+    if pet then
+        UnrealFX.learnPetName(pet)
     end
     UnrealFX.rememberRecentDamageChat(key, amount, abilityKey)
 end
@@ -1385,7 +1432,8 @@ function UnrealFX.OnCombatHappened(updateType, filterType)
         return
     end
     -- "Victim has been slain by Killer's Ability in Zone." - keep the ability for pairing.
-    local victim, killer, ability = msg:match(L"([%a]+) has been [%a]+ by ([%a]+)'s (.-) in [^%.]+%.")
+    -- Killer may be a multi-word pet name.
+    local victim, killer, ability = msg:match(L"([%a]+) has been [%a]+ by (.-)'s (.-) in [^%.]+%.")
     if victim == nil or killer == nil or victim == killer then
         return
     end
@@ -1402,6 +1450,13 @@ function UnrealFX.OnCombatHappened(updateType, filterType)
     end
 
     if playerKey ~= L"" and killerKey == playerKey then
+        UnrealFX.processPlayerKill(victim, "rvr", ability)
+        return
+    end
+
+    if UnrealFX.isPlayerPetKey(killerKey)
+        and UnrealFX.hasRecentDamageChatFor(victimKey, UnrealFX.FX_PET_KILL_RECENT_HIT_SECONDS)
+    then
         UnrealFX.processPlayerKill(victim, "rvr", ability)
     end
 end
