@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <ModuleFile xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-    <UiMod name="UnrealFX" version="2.0.0" date="2026-10-30">
+    <UiMod name="UnrealFX" version="2.0.1" date="2026-11-01">
         <VersionSettings gameVersion="1.4.8" windowsVersion="1.0" savedVariablesVersion="1.0" />
         <Author name="Talladego (maintainer); original UnrealDBAnnouncer by Ztil, Wholdar" email="" />
         <Description text="Based on UnrealDBAnnouncer by ztil / Wholdar (RoR forums). UT-style kill announcer with world-attached FX overlays. Plays WAVs via UnrealFX.exe / UnrealFX.py (OBS-friendly window). Supports RvR/PVE kills, multi-kill streaks, ready check / scenario / fortress / LOTD alerts, and grow/spin corpse FX. Slash: /ufx. Disable UnrealDBAnnouncer if both are installed." />

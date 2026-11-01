@@ -1,7 +1,6 @@
 UnrealFX = UnrealFX or {}
 UnrealFX.settings = UnrealFX.settings or {}
 UnrealFX.logFileName = "UnrealFX"
-UnrealFX.VERSION = "2.0.0"
 UnrealFX.prefixName = "UnrealFX"
 UnrealFX.prefixColor = { 255, 0, 0 }
 UnrealFX.helpHeaderColor = { 255, 220, 120 }
@@ -351,6 +350,30 @@ end
 
 -- One chat line per login. Printed from Initialize when /ufx is ready, otherwise
 -- after ALL_MODULES_INITIALIZED once the LibSlash retry has run.
+-- The version lives only in UnrealFX.mod (<UiMod version="...">); read it from
+-- the client's module list so there is a single place to bump.
+function UnrealFX.getVersion()
+    if UnrealFX._version then
+        return UnrealFX._version
+    end
+    local version = "?"
+    if type(ModulesGetData) == "function" then
+        local ok, mods = pcall(ModulesGetData)
+        if ok and type(mods) == "table" then
+            for _, mod in ipairs(mods) do
+                if type(mod) == "table" and mod.name == "UnrealFX" and mod.version ~= nil then
+                    version = tostring(mod.version)
+                    break
+                end
+            end
+        end
+    end
+    if version ~= "?" then
+        UnrealFX._version = version
+    end
+    return version
+end
+
 function UnrealFX.printLoginLine()
     if UnrealFX._loginLinePrinted then
         return
@@ -360,7 +383,7 @@ function UnrealFX.printLoginLine()
     if not UnrealFX._slashRegistered then
         hint = " Install LibSlash for /ufx commands."
     end
-    UnrealFX.chatPrint("v" .. tostring(UnrealFX.VERSION or "?") .. " loaded." .. hint)
+    UnrealFX.chatPrint("v" .. UnrealFX.getVersion() .. " loaded." .. hint)
 end
 
 function UnrealFX.collectUsedSpreeWorldIds()
@@ -3599,7 +3622,7 @@ function UnrealFX.printAlertSettings()
 end
 
 function UnrealFX.printStatus()
-    UnrealFX.chatPrint("Version: " .. (UnrealFX.VERSION or "?"))
+    UnrealFX.chatPrint("Version: " .. UnrealFX.getVersion())
     UnrealFX.printAlertSettings()
 end
 
