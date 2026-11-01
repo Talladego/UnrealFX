@@ -304,9 +304,6 @@ end
 function UnrealFX.Initialize()
     UnrealFX.playerNameKey = L""
     UnrealFX.getPlayerNameKey()
-    local version = UnrealFX.VERSION or "?"
-    EA_ChatWindow.Print(L"----UnrealFX v" .. towstring(version) .. L" loaded----")
-
     TextLogCreate(UnrealFX.logFileName, 18000)
     TextLogSetEnabled(UnrealFX.logFileName, true)
     TextLogSetIncrementalSaving(UnrealFX.logFileName, true, StringToWString("logs/"..UnrealFX.logFileName..".log"))
@@ -345,10 +342,25 @@ function UnrealFX.Initialize()
 
     UnrealFX.TryHookDialogManager()
     UnrealFX.TryRegisterReadyCheckPacket()
-    UnrealFX.RegisterSlashCommands()
+    if UnrealFX.RegisterSlashCommands() then
+        UnrealFX.printLoginLine()
+    end
     UnrealFX.updatePullAlertWatch()
     UnrealFX.captureHostileTarget()
-    UnrealFX.printAlertSettings()
+end
+
+-- One chat line per login. Printed from Initialize when /ufx is ready, otherwise
+-- after ALL_MODULES_INITIALIZED once the LibSlash retry has run.
+function UnrealFX.printLoginLine()
+    if UnrealFX._loginLinePrinted then
+        return
+    end
+    UnrealFX._loginLinePrinted = true
+    local hint = " Type /ufx for commands."
+    if not UnrealFX._slashRegistered then
+        hint = " Install LibSlash for /ufx commands."
+    end
+    UnrealFX.chatPrint("v" .. tostring(UnrealFX.VERSION or "?") .. " loaded." .. hint)
 end
 
 function UnrealFX.collectUsedSpreeWorldIds()
@@ -856,7 +868,7 @@ function UnrealFX.scoreDamagePair(chat, event, wantKey, now)
 end
 
 -- Among recent damage chats for victimName, pick the best amount-matched event id.
--- Skip the living current hostile (HP > 0) — that is still targeted, not the corpse.
+-- Skip the living current hostile (HP > 0) - that is still targeted, not the corpse.
 function UnrealFX.findBestDamagePairWorldId(victimName, usedIds)
     local want = UnrealFX.normalizeUnitName(victimName)
     if want == L"" then
@@ -1324,8 +1336,9 @@ function UnrealFX.OnChatKillHappened(updateType, filterType)
 end
 
 function UnrealFX.logDeathBlow(killType)
+    -- Incremental saving (enabled in Initialize) appends the entry to
+    -- logs/UnrealFX.log; no full TextLogSaveLog per keyword.
     TextLogAddEntry(UnrealFX.logFileName, 0, towstring(killType))
-    TextLogSaveLog(UnrealFX.logFileName,towstring(""))
 end
 
 function UnrealFX.markUnrealFX.killSpreeFxShown(entry, worldId)
@@ -3149,6 +3162,7 @@ end
 
 function UnrealFX.OnModulesInitialized()
     UnrealFX.RegisterSlashCommands()
+    UnrealFX.printLoginLine()
     UnrealFX.TryHookDialogManager()
     UnrealFX.TryRegisterReadyCheckPacket()
     -- Career/level data is reliably populated by now; re-evaluate in case

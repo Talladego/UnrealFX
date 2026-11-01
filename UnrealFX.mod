@@ -50,7 +50,7 @@
         <OnInitialize>
             <CallFunction name="UnrealFX.Initialize" />
         </OnInitialize>
-        <!-- Drive FX shake/fade here — world-attached windows stop OnUpdate when the entity dies. -->
+        <!-- Drive FX shake/fade here - world-attached windows stop OnUpdate when the entity dies. -->
         <OnUpdate>
             <CallFunction name="UnrealFX.OnFxUpdate" />
         </OnUpdate>
