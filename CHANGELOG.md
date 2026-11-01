@@ -8,8 +8,8 @@ Bug fixes.
   plays its announcer and overlay once, not twice.
 - Kill streaks (double kill and up) are timed reliably, including around
   midnight.
-- Overlays whose victim cannot be placed on screen move to your target, or to
-  you, instead of sitting in the top-left corner.
+- Overlays whose victim cannot be placed on screen stay where it was last seen
+  instead of jumping to another enemy.
 - /ufx works even when LibSlash loads after UnrealFX.
 - Healing a player or pet no longer prepares a kill overlay on them.
 - Rare Lua errors on empty or unexpected combat log lines are gone.
