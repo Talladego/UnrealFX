@@ -62,15 +62,52 @@ UnrealFX.targetSnap = UnrealFX.targetSnap or {
 UnrealFX.FX_RECENT_WORLD_OBJ_MAX = 96
 
 -- Fixed-size id -> time rings: parallel arrays, no per-entry tables. Setting a known
--- id updates it in place; a new id overwrites the oldest slot.
+-- id moves it to the newest slot (LRU), so an id still being hit is never evicted
+-- by newer ones; a new id overwrites the oldest slot. ring.cols lists extra
+-- parallel arrays that move with the id (ring.tmp is their reused swap row).
 local function newIdTimeRing(cap)
-    return { cap = cap, head = 0, count = 0, ids = {}, times = {}, slotById = {} }
+    return { cap = cap, head = 0, count = 0, ids = {}, times = {}, slotById = {}, cols = nil, tmp = nil }
+end
+-- Move the entry at slot to the head, shifting the newer entries back one slot.
+-- Cost is the number of newer entries (usually a few); no allocation.
+local function idRingMoveToHead(ring, slot)
+    local head = ring.head
+    if slot == head then
+        return slot
+    end
+    local cap, ids, times, slotById = ring.cap, ring.ids, ring.times, ring.slotById
+    local cols, tmp = ring.cols, ring.tmp
+    local nc = cols and #cols or 0
+    local id, t = ids[slot], times[slot]
+    for c = 1, nc do
+        tmp[c] = cols[c][slot]
+    end
+    local k = slot
+    while k ~= head do
+        local nx = (k % cap) + 1
+        local movedId = ids[nx]
+        ids[k] = movedId
+        times[k] = times[nx]
+        slotById[movedId] = k
+        for c = 1, nc do
+            local col = cols[c]
+            col[k] = col[nx]
+        end
+        k = nx
+    end
+    ids[head] = id
+    times[head] = t
+    slotById[id] = head
+    for c = 1, nc do
+        cols[c][head] = tmp[c]
+    end
+    return head
 end
 local function idRingSet(ring, id, t)
     local slot = ring.slotById[id]
     if slot then
         ring.times[slot] = t
-        return slot
+        return idRingMoveToHead(ring, slot)
     end
     local head = (ring.head % ring.cap) + 1
     ring.head = head
@@ -93,12 +130,12 @@ local function idRingGet(ring, id)
     end
     return nil
 end
--- k = 1 is the newest insert. Returns id, time.
+-- k = 1 is the most recently set id. Returns id, time.
 local function idRingAt(ring, k)
     local slot = ((ring.head - k) % ring.cap) + 1
     return ring.ids[slot], ring.times[slot]
 end
-UnrealFX._idRing = { new = newIdTimeRing, set = idRingSet, get = idRingGet, at = idRingAt }
+UnrealFX._idRing = { new = newIdTimeRing, set = idRingSet, get = idRingGet, at = idRingAt, toHead = idRingMoveToHead }
 -- Per-id time a target slot reported 0% HP (from PLAYER_TARGET_UPDATED snapshots).
 local zeroHpRing = newIdTimeRing(32)
 UnrealFX.zeroHpRing = zeroHpRing
@@ -107,15 +144,18 @@ local rewardRing = newIdTimeRing(32)
 UnrealFX.rewardRing = rewardRing
 -- Order matters: reward evidence is checked before 0% HP.
 UnrealFX._evidenceRings = { rewardRing, zeroHpRing }
--- Recent combat-hit ids (any hit, incl. heals). times = last event; extra parallel
--- arrays: dmgT (last damage/miss), armT (last damage = soft-arm), name/key cache and
--- nameT (last GetNameForObject call, so at most one lookup per id per second).
+-- Recent combat-hit ids (damage and misses; heals are not recorded). times = last
+-- event; extra parallel arrays: dmgT (last damage/miss), armT (last damage =
+-- soft-arm), name/key cache and nameT (last GetNameForObject call, so at most one
+-- lookup per id per second).
 local hitRing = newIdTimeRing(UnrealFX.FX_RECENT_WORLD_OBJ_MAX)
 hitRing.dmgT = {}
 hitRing.armT = {}
 hitRing.name = {}
 hitRing.key = {}
 hitRing.nameT = {}
+hitRing.cols = { hitRing.dmgT, hitRing.armT, hitRing.name, hitRing.key, hitRing.nameT }
+hitRing.tmp = {}
 UnrealFX.hitRing = hitRing
 UnrealFX.FX_NAME_LOOKUP_SECONDS = 1.0
 -- Kill-time scan caps (GetNameForObject probes per resolve).
@@ -2705,15 +2745,16 @@ function UnrealFX.OnWorldObjCombatEvent(...)
         return
     end
 
-    local now = UnrealFX.fxClock or 0
-    local slot = touchCombatHit(id, now)
-
-    -- Outgoing damage (negative amount) for YOUR_HITS chat pairing on kill resolve.
-    -- Heals (positive) never produce a kill victim: stop before the name lookup.
+    -- Heals (positive) never produce a kill victim: stop before recording anything,
+    -- so a healer's friendly targets do not churn the hit ring.
     local amount = tonumber(hitAmount) or 0
     if amount > 0 then
         return
     end
+
+    -- Outgoing damage (negative amount) for YOUR_HITS chat pairing on kill resolve.
+    local now = UnrealFX.fxClock or 0
+    local slot = touchCombatHit(id, now)
     hitRing.dmgT[slot] = now
     if amount < 0 then
         local abilityKey = nil
