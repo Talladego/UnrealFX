@@ -722,18 +722,29 @@ function UnrealFX.killEvidenceBonus(id, now)
     return bonus
 end
 
--- When the kill victim id is unknown / projection fails: current hostile, else self.
-function UnrealFX.resolveFxDisplayFallbackWorldId(excludeId, wantKey)
+-- Kill victim id still unknown after the pending retries. The hostile target is
+-- used only when it is the victim (name match, not hit after killT) or at 0% HP;
+-- a living, different hostile is never used. Else self (last resort).
+function UnrealFX.resolveFxDisplayFallbackWorldId(excludeId, wantKey, killT)
     excludeId = tonumber(excludeId) or 0
-    local hid = UnrealFX.getCurrentHostileWorldId()
-    if hid ~= 0 and hid ~= excludeId then
-        return hid
+    local snap = UnrealFX.targetSnap.hostile
+    local hid = tonumber(snap.id) or 0
+    if hid ~= 0 and hid ~= excludeId and hid ~= UnrealFX.getPlayerWorldObjNum() then
+        local now = UnrealFX.fxClock or 0
+        local zt = UnrealFX.getZeroHpTime(hid)
+        local atZero = (snap.hp ~= nil and snap.hp >= 0 and snap.hp <= 0)
+            or (zt ~= nil and (now - zt) <= (UnrealFX.FX_KILL_EVIDENCE_SECONDS or 3.0))
+        local isVictim = wantKey ~= nil and wantKey ~= L"" and snap.key == wantKey
+            and not UnrealFX.wasHitAfterKill(hid, killT)
+        if atZero or isVictim then
+            return hid, atZero and "target-0hp" or "target-victim"
+        end
     end
     local selfId = UnrealFX.getSelfWorldObjNum()
     if selfId ~= 0 and selfId ~= excludeId then
-        return selfId
+        return selfId, "self"
     end
-    return 0
+    return 0, "none"
 end
 
 function UnrealFX.consumeCombatHitWorldId(worldId)
@@ -798,6 +809,103 @@ function UnrealFX.isFxWindowStuckAtOrigin(win)
     return x >= 0 and x < 2 and y >= 0 and y < 2
 end
 
+-- Sentinel offset written before each Move. If the window still sits there after the
+-- client drew, Move did not place it (object missing), which is different from a
+-- victim legitimately near the top-left corner.
+UnrealFX.FX_SENTINEL_OFFSET = -4096
+UnrealFX.FX_SENTINEL_THRESHOLD = -2000
+-- Consecutive unplaced ticks before the FX is pinned to a fixed screen spot.
+UnrealFX.FX_MISSING_TICKS = 2
+
+function UnrealFX.canUseFxSentinel()
+    return type(WindowSetOffsetFromParent) == "function"
+        and type(MoveWindowToWorldObject) == "function"
+        and type(WindowGetScreenPosition) == "function"
+end
+
+function UnrealFX.isSentinelPosition(x, y)
+    local lim = UnrealFX.FX_SENTINEL_THRESHOLD or -2000
+    return x == nil or y == nil or (x <= lim and y <= lim)
+end
+
+function UnrealFX.getUiScale()
+    local scale = 1
+    if InterfaceCore and type(InterfaceCore.GetScale) == "function" then
+        local ok, s = pcall(InterfaceCore.GetScale)
+        s = ok and tonumber(s) or nil
+        if s and s > 0 then
+            scale = s
+        end
+    end
+    return scale
+end
+
+-- Victim cannot be placed: stop following and pin to Root at the last good screen
+-- position, else the stock EA_System_EventTextAnchor<id> spot, else screen center.
+-- Returns a short ASCII reason.
+function UnrealFX.anchorFxFixed(inst, win, worldId)
+    if not win or not DoesWindowExist(win) then
+        return "nowin"
+    end
+    worldId = tonumber(worldId) or 0
+    if worldId ~= 0 and type(DetachWindowFromWorldObject) == "function" then
+        pcall(DetachWindowFromWorldObject, win, worldId)
+    end
+    local scale = UnrealFX.getUiScale()
+    local dispW, dispH = UnrealFX.getFxDisplaySize()
+    local x, y, reason = nil, nil, "center"
+    if inst.hasLastPos then
+        x = inst.lastX / scale
+        y = inst.lastY / scale
+        reason = "lastpos"
+    elseif worldId ~= 0 and type(WindowGetScreenPosition) == "function" then
+        local anchor = "EA_System_EventTextAnchor" .. worldId
+        if DoesWindowExist(anchor) then
+            local ax, ay = WindowGetScreenPosition(anchor)
+            ax = tonumber(ax)
+            ay = tonumber(ay)
+            if ax and ay and not UnrealFX.isSentinelPosition(ax, ay) then
+                local aw, ah = 0, 0
+                if type(WindowGetDimensions) == "function" then
+                    local w, h = WindowGetDimensions(anchor)
+                    aw = tonumber(w) or 0
+                    ah = tonumber(h) or 0
+                end
+                x = ax / scale + (aw - dispW) / 2
+                y = ay / scale + (ah - dispH) / 2
+                reason = "eventtext"
+            end
+        end
+    end
+    if type(WindowClearAnchors) == "function" and type(WindowAddAnchor) == "function" then
+        WindowClearAnchors(win)
+        if x then
+            WindowAddAnchor(win, "topleft", "Root", "topleft", x, y)
+        else
+            WindowAddAnchor(win, "center", "Root", "center", 0, 0)
+        end
+    end
+    inst.fixedAnchor = true
+    return reason
+end
+
+-- One WindowGetScreenPosition per active FX per tick: remember where the client drew
+-- the previous projection, or count a miss when the sentinel is still there.
+function UnrealFX.sampleFxProjection(inst, win)
+    local x, y = WindowGetScreenPosition(win)
+    x = tonumber(x)
+    y = tonumber(y)
+    if UnrealFX.isSentinelPosition(x, y) then
+        inst.missingTicks = (inst.missingTicks or 0) + 1
+        return false
+    end
+    inst.missingTicks = 0
+    inst.lastX = x
+    inst.lastY = y
+    inst.hasLastPos = true
+    return true
+end
+
 -- Drop any Attach and project onto toWorldId instead.
 function UnrealFX.fallbackFxProjectToWorldId(win, fromWorldId, toWorldId)
     toWorldId = tonumber(toWorldId) or 0
@@ -819,7 +927,7 @@ function UnrealFX.fallbackFxProjectToWorldId(win, fromWorldId, toWorldId)
     return toWorldId
 end
 
--- Stuck / unknown id: current hostile first, then self.
+-- Unknown id: victim / 0% HP hostile first, then self.
 function UnrealFX.fallbackFxProjectToHostileOrSelf(win, fromWorldId)
     local toId = UnrealFX.resolveFxDisplayFallbackWorldId(fromWorldId)
     if toId == 0 then
@@ -2008,6 +2116,12 @@ function UnrealFX.releaseFxInstance(inst)
     inst.noSelfFallback = nil
     inst.projectTicks = nil
     inst.stuckChecked = nil
+    inst.fixedAnchor = nil
+    inst.fixedReason = nil
+    inst.hasLastPos = nil
+    inst.lastX = nil
+    inst.lastY = nil
+    inst.missingTicks = nil
     UnrealFX.fxFree = UnrealFX.fxFree or {}
     UnrealFX.fxFree[#UnrealFX.fxFree + 1] = inst
 end
@@ -2085,35 +2199,38 @@ function UnrealFX.tickFxInstance(inst, elapsed)
     inst.t = (inst.t or 0) + (tonumber(elapsed) or 0)
     local t = inst.t
 
-    -- Playing FX: chat-bubble projection each tick (no Attach). If the id parks at
-    -- screen origin / is off-screen, remount onto current hostile, else self.
-    -- The check reads the position the client drew for the PREVIOUS projection, so
-    -- it runs before re-projecting and only once one tick has passed since show.
-    -- Clients without MoveWindowToWorldObject (Attach) get one check.
+    -- Playing FX: chat-bubble projection each tick (no Attach). With Move, a sentinel
+    -- offset is set before each Move and the drawn position is read once on the next
+    -- tick: a real position is remembered, a sentinel counts as a miss. After
+    -- FX_MISSING_TICKS misses the FX is pinned (last position / event-text anchor /
+    -- screen center) instead of jumping to another target. Clients without the
+    -- sentinel APIs keep a one-time origin check.
     local followId = tonumber(inst.attachedId) or 0
-    if followId ~= 0 then
+    if followId ~= 0 and not inst.fixedAnchor then
         local ticks = inst.projectTicks or 0
-        if ticks >= 1
-            and not inst.fellBackToSelf
-            and not inst.noSelfFallback
-            and (inst.useMoveProject or not inst.stuckChecked)
-        then
-            inst.stuckChecked = true
-            if UnrealFX.isFxWindowStuckAtOrigin(win) then
-                local fb = UnrealFX.fallbackFxProjectToHostileOrSelf(win, followId)
-                if fb ~= 0 then
-                    followId = fb
-                    inst.attachedId = fb
-                    UnrealFX.markFxDoneWorldId(fb)
-                    local selfId = UnrealFX.getSelfWorldObjNum()
-                    if selfId ~= 0 and fb == selfId then
-                        inst.fellBackToSelf = true
-                    end
+        local watch = not inst.fellBackToSelf and not inst.noSelfFallback
+        if inst.useMoveProject and UnrealFX.canUseFxSentinel() then
+            if ticks >= 1 and watch then
+                UnrealFX.sampleFxProjection(inst, win)
+                if (inst.missingTicks or 0) >= (UnrealFX.FX_MISSING_TICKS or 2) then
+                    inst.fixedReason = UnrealFX.anchorFxFixed(inst, win, followId)
                 end
             end
-        end
-        if inst.useMoveProject then
-            UnrealFX.projectFxToWorldObject(win, followId)
+            if not inst.fixedAnchor then
+                local s = UnrealFX.FX_SENTINEL_OFFSET or -4096
+                WindowSetOffsetFromParent(win, s, s)
+                UnrealFX.projectFxToWorldObject(win, followId)
+            end
+        else
+            if ticks >= 1 and watch and not inst.stuckChecked then
+                inst.stuckChecked = true
+                if UnrealFX.isFxWindowStuckAtOrigin(win) then
+                    inst.fixedReason = UnrealFX.anchorFxFixed(inst, win, followId)
+                end
+            end
+            if inst.useMoveProject and not inst.fixedAnchor then
+                UnrealFX.projectFxToWorldObject(win, followId)
+            end
         end
         inst.projectTicks = ticks + 1
     end
@@ -2869,7 +2986,8 @@ end
 -- Unresolved after the last try: never a living, different hostile.
 function UnrealFX.finishPendingKillFallback(pending)
     local entry = pending.entry
-    local worldId = UnrealFX.resolveFxDisplayFallbackWorldId(0, pending.want)
+    local worldId, reason = UnrealFX.resolveFxDisplayFallbackWorldId(0, pending.want, entry.killT)
+    pending.reason = reason
     local shown = false
     if worldId ~= 0 then
         shown = UnrealFX.showFxOnWorldObject(pending.fxKey, worldId, {
@@ -3099,7 +3217,15 @@ function UnrealFX.showFxOnWorldObject(requestedKey, worldId, opts)
     local useMove = type(MoveWindowToWorldObject) == "function"
     local attachId = worldId
     local selfId = UnrealFX.getSelfWorldObjNum()
+    if inst.fixedAnchor and type(WindowClearAnchors) == "function" then
+        -- Restart on an instance that was pinned to Root: drop that anchor.
+        WindowClearAnchors(win)
+    end
     WindowSetShowing(win, true)
+    if useMove and UnrealFX.canUseFxSentinel() then
+        local s = UnrealFX.FX_SENTINEL_OFFSET or -4096
+        WindowSetOffsetFromParent(win, s, s)
+    end
     UnrealFX.projectFxToWorldObject(win, attachId)
     if type(ForceUpdateWorldObjectWindow) == "function" then
         pcall(ForceUpdateWorldObjectWindow, attachId, win)
@@ -3134,6 +3260,10 @@ function UnrealFX.showFxOnWorldObject(requestedKey, worldId, opts)
     inst.noSelfFallback = opts.noSelfFallback == true
     inst.projectTicks = 0
     inst.stuckChecked = false
+    inst.fixedAnchor = false
+    inst.fixedReason = nil
+    inst.hasLastPos = false
+    inst.missingTicks = 0
     inst.fellBackToSelf = selfId ~= 0 and attachId == selfId
     -- Block re-arm / re-FX on the intended corpse even if we displayed on self.
     UnrealFX.markFxDoneWorldId(worldId)
