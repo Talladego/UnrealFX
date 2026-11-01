@@ -102,6 +102,9 @@ UnrealFX._idRing = { new = newIdTimeRing, set = idRingSet, get = idRingGet, at =
 -- Per-id time a target slot reported 0% HP (from PLAYER_TARGET_UPDATED snapshots).
 local zeroHpRing = newIdTimeRing(32)
 UnrealFX.zeroHpRing = zeroHpRing
+-- Per-id time of WORLD_OBJ_XP_GAINED / WORLD_OBJ_RENOWN_GAINED (never the player id).
+local rewardRing = newIdTimeRing(32)
+UnrealFX.rewardRing = rewardRing
 -- Recent combat-hit ids (any hit, incl. heals). times = last event; extra parallel
 -- arrays: dmgT (last damage/miss), armT (last damage = soft-arm), name/key cache and
 -- nameT (last GetNameForObject call, so at most one lookup per id per second).
@@ -442,6 +445,12 @@ function UnrealFX.Initialize()
         if SystemData.Events.WORLD_OBJ_COMBAT_EVENT then
             RegisterEventHandler(SystemData.Events.WORLD_OBJ_COMBAT_EVENT, "UnrealFX.OnWorldObjCombatEvent")
         end
+        if SystemData.Events.WORLD_OBJ_XP_GAINED then
+            RegisterEventHandler(SystemData.Events.WORLD_OBJ_XP_GAINED, "UnrealFX.OnWorldObjXpGained")
+        end
+        if SystemData.Events.WORLD_OBJ_RENOWN_GAINED then
+            RegisterEventHandler(SystemData.Events.WORLD_OBJ_RENOWN_GAINED, "UnrealFX.OnWorldObjRenownGained")
+        end
         if SystemData.Events.PLAYER_TARGET_UPDATED then
             RegisterEventHandler(SystemData.Events.PLAYER_TARGET_UPDATED, "UnrealFX.OnPlayerTargetUpdated")
         end
@@ -641,6 +650,59 @@ end
 -- Time the id was last seen at 0% HP in a target slot, or nil.
 function UnrealFX.getZeroHpTime(id)
     return idRingGet(zeroHpRing, tonumber(id) or 0)
+end
+
+-- XP / renown floating-text events: (hitTargetObjectNumber, pointsGained). Stock uses
+-- them for the reward text above an object; when that object is not the player it is
+-- kill evidence for that id. The player's own id is never stored.
+function UnrealFX.onWorldObjReward(kind, hitTargetObjectNumber, pointsGained)
+    local id = tonumber(hitTargetObjectNumber) or 0
+    if id == 0 or id == UnrealFX.getPlayerWorldObjNum() then
+        return false
+    end
+    idRingSet(rewardRing, id, UnrealFX.fxClock or 0)
+    return true
+end
+
+function UnrealFX.OnWorldObjXpGained(hitTargetObjectNumber, pointsGained)
+    UnrealFX.onWorldObjReward("xp", hitTargetObjectNumber, pointsGained)
+end
+
+function UnrealFX.OnWorldObjRenownGained(hitTargetObjectNumber, pointsGained)
+    UnrealFX.onWorldObjReward("renown", hitTargetObjectNumber, pointsGained)
+end
+
+function UnrealFX.getRewardTime(id)
+    id = tonumber(id) or 0
+    if id == 0 or id == UnrealFX.getPlayerWorldObjNum() then
+        return nil
+    end
+    return idRingGet(rewardRing, id)
+end
+
+-- Kill-time evidence window for 0% HP / XP / renown on a candidate id.
+UnrealFX.FX_KILL_EVIDENCE_SECONDS = 3.0
+UnrealFX.FX_REWARD_EVIDENCE_BONUS = 1200
+UnrealFX.FX_ZERO_HP_EVIDENCE_BONUS = 800
+
+-- Bonus for a candidate id that just gave XP/renown or reported 0% HP.
+function UnrealFX.killEvidenceBonus(id, now)
+    id = tonumber(id) or 0
+    if id == 0 or id == UnrealFX.getPlayerWorldObjNum() then
+        return 0
+    end
+    now = now or (UnrealFX.fxClock or 0)
+    local win = UnrealFX.FX_KILL_EVIDENCE_SECONDS or 3.0
+    local bonus = 0
+    local rt = idRingGet(rewardRing, id)
+    if rt and (now - rt) <= win then
+        bonus = bonus + (UnrealFX.FX_REWARD_EVIDENCE_BONUS or 1200)
+    end
+    local zt = idRingGet(zeroHpRing, id)
+    if zt and (now - zt) <= win then
+        bonus = bonus + (UnrealFX.FX_ZERO_HP_EVIDENCE_BONUS or 800)
+    end
+    return bonus
 end
 
 -- When the kill victim id is unknown / projection fails: current hostile, else self.
@@ -1032,6 +1094,8 @@ function UnrealFX.scoreDamagePair(chat, event, wantKey, now, killAbility)
             score = score - (UnrealFX.FX_PAIR_ABILITY_DISAGREE_PENALTY or 800)
         end
     end
+    score = score + UnrealFX.killEvidenceBonus(id, now)
+
     local pairAbility = chatAbility or eventAbility
     if killAbility and pairAbility then
         if pairAbility == killAbility then
