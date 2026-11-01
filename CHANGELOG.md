@@ -13,6 +13,7 @@ Bug fixes.
 - /ufx works even when LibSlash loads after UnrealFX.
 - Healing a player or pet no longer prepares a kill overlay on them.
 - Rare Lua errors on empty or unexpected combat log lines are gone.
+- Kill effects land on the right enemy more often.
 
 Performance improvements.
 
